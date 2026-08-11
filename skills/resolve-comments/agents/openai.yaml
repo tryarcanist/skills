@@ -1,0 +1,4 @@
+interface:
+  display_name: "Resolve Comments"
+  short_description: "Address unresolved, deduped PR comments"
+  default_prompt: "Use $resolve-comments to process every unresolved PR review comment and actionable top-level PR comment for this PR URL or number."
