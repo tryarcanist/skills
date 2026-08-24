@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audit Code Reviewers"
+  short_description: "Compare AI reviewers on equal evidence"
+  default_prompt: "Use $audit-code-reviewers to compare every AI code reviewer active on this repository and recommend which to keep, change, cut, or leave undecided."
