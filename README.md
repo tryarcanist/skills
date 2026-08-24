@@ -13,6 +13,7 @@ Handle every actionable PR review comment before merge.
 - Reads unresolved inline threads and top-level conversation findings
 - Dedupes exact duplicate feedback
 - Fixes code, replies, or tracks out-of-scope work
+- Assesses whether Zeus's inline agent prompts are complete handoffs for another coding agent
 - Resolves threads and labels the PR when the run is complete
 - Works with human reviewers and bots, including [Zeus](https://tryarcanist.com) (`@arcanist /review`)
 
