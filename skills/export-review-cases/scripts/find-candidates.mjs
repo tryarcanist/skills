@@ -167,17 +167,42 @@ absorb(collectWindow(args.since, args.until));
 // under test that was a quarter of the merged population. The commenter search
 // qualifier finds those PRs; the union is what caught mode actually needs.
 if (args.mode === "caught") {
+  const hasRosterReviewBody = (pr) =>
+    (pr.reviews || []).some((r) => roster.has(r.author?.login) && String(r.body || "").trim().length > 0);
+
   for (const spelling of roster.spellings) {
-    const before = byNumber.size;
-    const found = collectWindow(args.since, args.until, `commenter:${spelling}`);
+    // GitHub's commenter: qualifier wants the account's real login. A roster
+    // written without the [bot] suffix -- which this skill documents as valid,
+    // because some app reviewers genuinely have no suffix -- would otherwise
+    // search a different account and quietly return nothing, losing exactly
+    // the summary-only population this sweep exists to recover.
+    const attempts = spelling.endsWith("[bot]") ? [spelling] : [spelling, `${spelling}[bot]`];
+    let found = [];
+    let usedSpelling = spelling;
+    for (const attempt of attempts) {
+      found = collectWindow(args.since, args.until, `commenter:${attempt}`);
+      usedSpelling = attempt;
+      if (found.length) break;
+    }
+    if (!found.length) {
+      warn(`commenter:${attempts.join(" and commenter:")} matched no PRs; check the reviewer login spelling`);
+      continue;
+    }
+    if (usedSpelling !== spelling) {
+      warn(`commenter:${spelling} matched nothing; used commenter:${usedSpelling} instead`);
+    }
     absorb(found);
     for (const pr of found) {
       if (!commentedBy.has(pr.number)) commentedBy.set(pr.number, []);
       commentedBy.get(pr.number).push(spelling);
     }
-    const added = byNumber.size - before;
+    // The base sweep has already loaded every merged PR, so "how many did this
+    // add to the set" is always zero and says nothing. What matters is how many
+    // of these have no review body at all -- those are invisible without it.
+    const bodyless = found.filter((pr) => !hasRosterReviewBody(pr)).length;
     process.stderr.write(
-      `commenter:${spelling}: ${found.length} PR(s), ${added} of them with no published review body at all\n`,
+      `commenter:${usedSpelling}: ${found.length} PR(s), ${bodyless} of which publish no roster review body ` +
+        `and are visible only through this sweep\n`,
     );
   }
 }
@@ -242,7 +267,14 @@ if (args.mode === "shipped") {
         },
       };
     })
-    .sort((a, b) => b.reviewers.length - a.reviewers.length || b.reviewBodies - a.reviewBodies || a.changedFiles - b.changedFiles);
+    // Rank by disagreement, not agreement. A pull request every reviewer
+    // commented on teaches little; one where a reviewer published and another
+    // stayed silent is where the interesting comparison lives.
+    .map((c) => ({ ...c, rosterSilent: roster.logins.length - c.reviewers.length }))
+    .sort((a, b) =>
+      (b.rosterSilent > 0 ? 1 : 0) - (a.rosterSilent > 0 ? 1 : 0) ||
+      b.reviewers.length - a.reviewers.length ||
+      a.changedFiles - b.changedFiles);
 }
 
 const out = {

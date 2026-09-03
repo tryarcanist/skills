@@ -45,7 +45,11 @@ Build a shareable set of paired pull requests: a bug that shipped past an AI cod
 - The set is mined backwards from merged fixes, so it can surface bugs no reviewer ever mentioned.
 - Each missed case names the exact commit the reviewer read and proves the buggy lines already existed there.
 - Presence is established by commit ancestry or by verbatim content, so squash-merge repositories work too.
-- A second reader has to try to overturn every case before it can be exported.
+- Tests, fixtures, comments and imports cannot decide whether a reviewer saw a bug.
+- "The reviewer read this and the bug was not there" and "nothing is known" stay separate answers.
+- The window is collected completely rather than truncated to its most recent days.
+- Cases are generated as stubs from the evidence, not written by hand.
+- A second reader has to try to overturn every case, and the bundler re-checks each one against the code before export.
 - Source patches are opt-in, and scoped to the files each case names.
 - The bundle is a lower bound on what happened, not a recall measurement, and it says so.
 - The skill only requires authenticated `gh`, `git`, and Node.js, run from a full clone.

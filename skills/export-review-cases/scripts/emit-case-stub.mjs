@@ -46,14 +46,31 @@ export function slug(text, max = 40) {
     .replace(/-+$/, "");
 }
 
-// What the reviewer published at or around the reviewed commit. A missed case
-// has no quotes by definition, so without this the bundle carries no evidence
-// of what the reviewer was doing instead -- which is the contrast that makes a
-// miss legible to whoever has to improve the reviewer.
+// Reviewers wrap their output in machine metadata -- HTML marker comments,
+// base64 deep links, collapsed detail blocks. Left in, a 600-character excerpt
+// can be entirely markers and carry no signal at all.
+export function cleanExcerpt(body) {
+  return String(body || "")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<a\s[^>]*>[\s\S]*?<\/a>/gi, " ")
+    .replace(/\]\(https?:\/\/[^)]{80,}\)/g, "](link)")
+    .replace(/<\/?(details|summary|img|br|p|div|sub|sup)[^>]*>/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, EXCERPT_CHARS);
+}
+
+// Everything the reviewer published on this pull request, flagged by whether it
+// landed on the reviewed commit.
+//
+// A missed case has no quotes by definition, so this is the only evidence of
+// what the reviewer was doing instead -- and "it signed off clear on a later
+// commit with the bug still in the file" is the most damning item there is.
+// Filtering to the first opportunity dropped exactly those, because the
+// earliest reviewed commit carries the least output.
 export function publishedItemsAt(reviewerOutput, reviewer, reviewedCommit) {
   return (reviewerOutput || [])
     .filter((item) => normalizeLogin(item.reviewer) === normalizeLogin(reviewer))
-    .filter((item) => !reviewedCommit || !item.reviewedCommit || item.reviewedCommit === reviewedCommit)
     .map((item) => ({
       id: item.id,
       kind: item.kind,
@@ -61,7 +78,8 @@ export function publishedItemsAt(reviewerOutput, reviewer, reviewedCommit) {
       path: item.path || null,
       line: item.line ?? null,
       reviewedCommit: item.reviewedCommit || null,
-      excerpt: String(item.body || "").slice(0, EXCERPT_CHARS),
+      atReviewedCommit: Boolean(reviewedCommit) && item.reviewedCommit === reviewedCommit,
+      excerpt: cleanExcerpt(item.body),
       bodyTruncated: Boolean(item.bodyTruncated),
     }));
 }
@@ -80,10 +98,14 @@ function selfTest() {
     { reviewer: "cursor[bot]", id: "inline-3", kind: "inline", body: "z", reviewedCommit: "aaa" },
     { reviewer: "arcanist[bot]", id: "comment-4", kind: "summary", body: "w", reviewedCommit: null },
   ];
-  eq("only this reviewer, only this commit, plus unpinned",
-    publishedItemsAt(output, "arcanist", "aaa").map((i) => i.id), ["inline-1", "comment-4"]);
+  eq("every item this reviewer published is carried, flagged by commit",
+    publishedItemsAt(output, "arcanist", "aaa").map((i) => [i.id, i.atReviewedCommit]),
+    [["inline-1", true], ["inline-2", false], ["comment-4", false]]);
   eq("roster spelling does not change the match",
-    publishedItemsAt(output, "arcanist[bot]", "aaa").map((i) => i.id), ["inline-1", "comment-4"]);
+    publishedItemsAt(output, "arcanist[bot]", "aaa").map((i) => i.id), ["inline-1", "inline-2", "comment-4"]);
+  eq("marker comments and link blobs are stripped from excerpts",
+    cleanExcerpt('<!-- BUGBOT_REVIEW --><a href="https://cursor.com/open?link=eyJ2Ijo">open</a>\nThe guard admits email.'),
+    "The guard admits email.");
   eq("a reviewer with nothing published yields an empty list",
     publishedItemsAt(output, "greptile-apps", "aaa"), []);
 
@@ -132,7 +154,10 @@ if (args.trace) {
   const reviewedCommit = reviewer.firstOpportunity.sha;
   stub = {
     schemaVersion: "review-case-v1",
-    caseId: `TODO-${trace.fix.pr}-${slug(trace.fix.title, 30)}`,
+    // Reviewer and origin are part of the identity: two cases from one fix
+    // about two different vendors would otherwise collide in the filename, the
+    // bundle heading, and the rejection list.
+    caseId: `TODO-${trace.fix.pr}-from-${originPr.number}-${slug(reviewer.reviewer, 16)}-${slug(trace.fix.title, 24)}`,
     repo: trace.repo,
     reviewer: reviewer.reviewer,
     verdict: TODO("missed or caught, after reading what the reviewer published below"),
@@ -175,12 +200,16 @@ if (args.trace) {
       mergeCommit: trace.fix.mergeCommit,
       mergedAt: trace.fix.mergedAt,
       summary: TODO("what the fix changed, in one line"),
-      paths: trace.files.filter((f) => f.state === "observed").map((f) => f.path),
+      // Scoped to the file the needle came from. --include-source uses this,
+      // and widening it here would export files the case never discusses.
+      // Add a path by hand if the mechanism genuinely spans two files.
+      paths: origin.buggyBlock ? [origin.buggyBlock.path] : [],
     },
     whatWouldHaveCaughtIt: TODO("a concrete act: the command to run, the caller to open, the two paths to compare"),
     skeptic: { ran: false, verdict: null, note: null },
     provenance: {
       trace: args.trace,
+      allFixPaths: trace.files.filter((f) => f.state === "observed").map((f) => f.path),
       buggyBlock: origin.buggyBlock,
       rejectedBlocks: origin.rejectedBlocks,
       presenceReason: reviewer.reason,
@@ -194,7 +223,7 @@ if (args.trace) {
 
   stub = {
     schemaVersion: "review-case-v1",
-    caseId: `TODO-${reviews.pr.number}-${slug(finding.path || finding.kind, 30)}`,
+    caseId: `TODO-${reviews.pr.number}-${slug(finding.reviewer, 16)}-${slug(finding.id, 24)}`,
     repo: reviews.repo,
     reviewer: finding.reviewer,
     verdict: TODO('"caught" if this finding describes a real defect at the reviewed commit'),
@@ -218,7 +247,7 @@ if (args.trace) {
       paths: finding.path ? [finding.path] : [],
       lines: finding.line ? [finding.line, finding.line] : null,
     },
-    fixedInSamePr: true,
+    fixedInSamePr: TODO("true only if a commit on this PR actually repaired the mechanism"),
     reviewedAt: {
       commit: finding.reviewedCommit,
       reviewer: finding.reviewer,
@@ -231,7 +260,12 @@ if (args.trace) {
       quotes: [String(finding.body || "").slice(0, EXCERPT_CHARS)],
       publishedItems: publishedItemsAt(reviews.findings, finding.reviewer, finding.reviewedCommit),
     },
-    fix: { pr: null, url: null, summary: TODO("what repaired it, or null if nothing did"), paths: finding.path ? [finding.path] : [] },
+    fix: {
+      pr: null, url: null,
+      commit: TODO("the commit that repaired it, if resolution is fixed and it landed on this PR"),
+      summary: TODO("what repaired it, or null if nothing did"),
+      paths: finding.path ? [finding.path] : [],
+    },
     whatWouldHaveCaughtIt: TODO("what this reviewer did that the others did not"),
     skeptic: { ran: false, verdict: null, note: null },
     provenance: {

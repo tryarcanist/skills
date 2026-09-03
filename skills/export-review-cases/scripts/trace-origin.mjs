@@ -39,14 +39,22 @@ import {
 import { fetchReviewerOutput, reviewedCommitsByReviewer } from "./lib/reviews.mjs";
 
 const DEFAULT_MAX_ORIGINS = 5;
-const DEFAULT_MIN_LINES = 2;
-const DEFAULT_MIN_SHARE = 0.1;
+// A one-line root cause is the most common bug shape there is, and pooling
+// share across every file of a multi-file fix puts one below any threshold by
+// construction. Both gates cost real cases in testing and neither was load
+// bearing once non-product paths, deletion-only ranges and needle substance
+// were enforced, so both default to off.
+const DEFAULT_MIN_LINES = 1;
+const DEFAULT_MIN_SHARE = 0;
 const MIN_BLOCK_CHARS = 40;
 
 // Files whose blame says nothing about who introduced a defect.
 const UNINFORMATIVE_PATH =
   /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Cargo\.lock|go\.sum|composer\.lock)$|\.(snap|lock|svg|png|jpe?g|gif|ico|pdf|min\.js|min\.css)$/i;
 
+// CI and workflow files are deliberately NOT excluded: `bug.boundary` offers
+// `infra-config`, and a bug introduced in a workflow is a real shipped bug.
+//
 // Non-product files. A fix almost always touches its own tests, and blaming
 // those tests attributes the bug to whoever last edited a fixture. In testing
 // this produced eligibility verdicts decided by a mock branch, a docstring and
@@ -63,18 +71,85 @@ const HISTORY_ARTIFACT_SUBJECT =
 
 // Lines that appear in every large file and therefore identify nothing.
 const NOISE_LINE =
-  /^\s*(?:\/\/|#(?!\s*(?:if|include|define))|\*|\/\*|--|<!--|"{3}|'{3}|import\s|from\s+\S+\s+import\s|export\s*\{|use\s+\w|package\s+\w|require\(|@\w+\s*$|[{}()\[\];,]*$)/;
+  /^\s*(?:\/\/|#(?!\s*(?:if|include|define))|\*|\/\*|--|<!--|import\s|from\s+\S+\s+import\s|export\s*\{|use\s+\w|package\s+\w|require\(|@\w+\s*$|[{}()\[\];,]*$)/;
 
-// How much of a block is actually distinguishing code, after dropping comments,
-// imports, docstrings and punctuation-only lines. A needle made of boilerplate
-// answers the presence question by accident, in whichever direction the file
-// happens to fall.
+const DOCSTRING_FENCE = /("{3}|'{3})/g;
+
+// Executable logic: a call, a branch, a comparison, an assignment with an
+// operator. Its absence does not disqualify a needle, but its presence is what
+// separates "the code that misbehaves" from "a declaration the fix happened to
+// touch" -- a widened type alias, an interface field, a css rule.
+const STATEMENT_SIGNAL =
+  /\b(if|else|for|while|return|throw|await|switch|case|try|catch|finally|yield|raise|assert|def|func|function|lambda|match)\b|=>|->|\w\s*\(|[!<>]=|==|&&|\|\||\?\?|\+=|-=|\.\w+\(|[\w\]\)](?:\.\w+|\[[^\]]+\])\s*=[^=]/;
+
+// Which lines of a file are inside a docstring or block comment.
+//
+// This has to be computed over the whole file, not over the candidate block. A
+// single line lifted from the middle of a docstring carries no fence, so a
+// block-local scan cannot tell prose from code -- and a sentence of
+// documentation then decides whether a reviewer had seen a bug.
+export function commentMask(content) {
+  const lines = String(content || "").split("\n");
+  const mask = new Array(lines.length).fill(false);
+  let inDocstring = false;
+  let inBlockComment = false;
+  lines.forEach((raw, i) => {
+    const line = raw.trim();
+    if (inBlockComment) {
+      mask[i] = true;
+      if (line.includes("*/")) inBlockComment = false;
+      return;
+    }
+    if (inDocstring) {
+      mask[i] = true;
+      if ((line.match(DOCSTRING_FENCE) || []).length % 2 === 1) inDocstring = false;
+      return;
+    }
+    const fences = (line.match(DOCSTRING_FENCE) || []).length;
+    if (fences % 2 === 1) {
+      mask[i] = true;
+      inDocstring = true;
+      return;
+    }
+    if (fences > 0) {
+      mask[i] = true;
+      return;
+    }
+    if (line.includes("/*") && !line.includes("*/")) {
+      mask[i] = true;
+      inBlockComment = true;
+    }
+  });
+  return mask;
+}
+
+// Substantive code lines of one run, given the file's comment mask.
+function runCodeLines(lines, mask, start, end) {
+  const out = [];
+  for (let n = start; n <= end && n <= lines.length; n += 1) {
+    const raw = lines[n - 1];
+    if (mask[n - 1] || !raw || !raw.trim() || NOISE_LINE.test(raw)) continue;
+    out.push(raw.trim().replace(/\s+/g, " "));
+  }
+  return out;
+}
+
+// Block-local versions, for callers with no surrounding file.
+function codeLines(block) {
+  const lines = String(block || "").split("\n");
+  return runCodeLines(lines, commentMask(block), 1, lines.length);
+}
+
+// How much of a block is actually distinguishing code. A needle made of
+// boilerplate answers the presence question by accident, in whichever
+// direction the file happens to fall.
 export function substantiveLength(block) {
-  return String(block || "")
-    .split("\n")
-    .filter((l) => l.trim().length > 0 && !NOISE_LINE.test(l))
-    .map((l) => l.trim().replace(/\s+/g, " "))
-    .join("\n").length;
+  return codeLines(block).join("\n").length;
+}
+
+// Does the block contain executable logic, or only declarations?
+export function needleKind(block) {
+  return codeLines(block).some((l) => STATEMENT_SIGNAL.test(l)) ? "statement" : "declaration";
 }
 
 function usage(msg) {
@@ -109,6 +184,31 @@ function selfTest() {
   eq("a comment line is not substantive", substantiveLength("// Yield so the first run entered the workflow and claimed the slot."), 0);
   eq("a docstring line is not substantive", substantiveLength('"""Create an organization in the database for integration tests."""'), 0);
   eq("real code is substantive", substantiveLength("if (!member) return { ok: true };\n  ledger.record(member.id, now);") >= MIN_BLOCK_CHARS, true);
+  eq("prose inside a docstring is not substantive",
+    substantiveLength('"""\nRetries are dispatched hourly so that a failed report is picked up\nby the next scheduled run without operator action.\n"""'), 0);
+  eq("a block comment interior is not substantive",
+    substantiveLength("/*\n  This explains at length why the cadence was chosen.\n*/"), 0);
+  eq("code after a docstring survives",
+    needleKind('"""Doc."""\nif (retry.count > limit) { return null; }'), "statement");
+  eq("a statement needle is a statement", needleKind('queryClient.invalidateQueries({ queryKey: ["a"] });'), "statement");
+  eq("a type alias is only a declaration", needleKind('type JobStatus = "active" | "terminal_failed";'), "declaration");
+  eq("an interface field list is only a declaration", needleKind("  retries: number;\n  lastRunAt: string;"), "declaration");
+  eq("a css rule is only a declaration", needleKind(".panel { margin-top: 12px; }"), "declaration");
+  eq("an object member the fix rewrote is still a usable declaration needle",
+    [needleKind("staleTime: Infinity,"), substantiveLength("staleTime: Infinity,") > 0], ["declaration", true]);
+  eq("assignment to a member or index is a statement",
+    needleKind('response.headers["Cache-Control"] = "public, max-age=3600"'), "statement");
+  const pyFile = [
+    "def options(db):",
+    '    """Return all integration vendor options.',
+    "",
+    "    Public endpoint. Integration enum values are static;",
+    "    group list requires a DB query.",
+    '    """',
+    '    response.headers["Cache-Control"] = "public, max-age=3600"',
+  ].join("\n");
+  eq("a docstring interior is masked across the whole file",
+    commentMask(pyFile).map((m) => (m ? 1 : 0)), [0, 1, 1, 1, 1, 1, 0]);
 
   for (const c of cases) process.stdout.write(`${c.ok ? "ok  " : "FAIL"} ${c.name}\n`);
   const failed = cases.filter((c) => !c.ok);
@@ -230,13 +330,20 @@ for (const file of files) {
   fileObservations.push({ path: file.filename, prePath, status: file.status, state: "observed", ranges: observed });
 }
 
-const totalBlamedLines = [...originStats.values()].reduce((n, s) => n + s.lines, 0);
+// Counted after history artefacts are identified below, so that a subtree
+// import the script has already decided to ignore cannot dilute a real
+// origin's share.
+let totalBlamedLines = 0;
 for (const stat of originStats.values()) {
   const meta = commitMeta(repoPath, stat.sha);
   stat.subject = meta?.subject || null;
   stat.meta = meta;
-  stat.share = totalBlamedLines ? Number((stat.lines / totalBlamedLines).toFixed(3)) : null;
   stat.historyArtifact = HISTORY_ARTIFACT_SUBJECT.test(stat.subject || "");
+}
+
+totalBlamedLines = [...originStats.values()].filter((x) => !x.historyArtifact).reduce((n, x) => n + x.lines, 0);
+for (const stat of originStats.values()) {
+  stat.share = totalBlamedLines && !stat.historyArtifact ? Number((stat.lines / totalBlamedLines).toFixed(3)) : null;
 }
 
 const artefacts = [...originStats.values()].filter((x) => x.historyArtifact);
@@ -272,26 +379,38 @@ function bestBlock(stat) {
     if (ev.anchorOnly) continue;
     for (const run of ev.runs) options.push({ path: ev.path, run });
   }
-  options.sort((a, b) => b.run.end - b.run.start - (a.run.end - a.run.start));
   const rejected = [];
+  const usable = [];
+  const fileCache = new Map();
   for (const option of options) {
-    const content = fileAt(repoPath, preFixSha, option.path);
-    if (content === null) continue;
-    const block = content.split("\n").slice(option.run.start - 1, option.run.end).join("\n");
-    const weight = substantiveLength(block);
+    if (!fileCache.has(option.path)) {
+      const text = fileAt(repoPath, preFixSha, option.path);
+      fileCache.set(option.path, text === null ? null : { lines: text.split("\n"), mask: commentMask(text) });
+    }
+    const file = fileCache.get(option.path);
+    if (file === null) continue;
+    const block = file.lines.slice(option.run.start - 1, option.run.end).join("\n");
+    const kept = runCodeLines(file.lines, file.mask, option.run.start, option.run.end);
+    const weight = kept.join("\n").length;
+    const kind = kept.some((l) => STATEMENT_SIGNAL.test(l)) ? "statement" : "declaration";
     if (weight < MIN_BLOCK_CHARS) {
-      rejected.push({ path: option.path, start: option.run.start, end: option.run.end, substantiveChars: weight });
+      rejected.push({ path: option.path, start: option.run.start, end: option.run.end, substantiveChars: weight, needleKind: kind });
       continue;
     }
-    return {
-      block: {
-        path: option.path, start: option.run.start, end: option.run.end,
-        block, substantiveChars: weight, lines: option.run.end - option.run.start + 1,
-      },
-      rejected,
-    };
+    usable.push({
+      path: option.path, start: option.run.start, end: option.run.end,
+      block, substantiveChars: weight, needleKind: kind,
+      lines: option.run.end - option.run.start + 1,
+    });
   }
-  return { block: null, rejected };
+  // Sorting by raw run length steered toward comment blocks, which are the
+  // longest single-author runs in most files. Prefer executable logic, then
+  // the most distinguishing code.
+  usable.sort((a, b) => {
+    if (a.needleKind !== b.needleKind) return a.needleKind === "statement" ? -1 : 1;
+    return b.substantiveChars - a.substantiveChars;
+  });
+  return { block: usable[0] || null, rejected };
 }
 
 function presenceAt(stat, block, reviewedCommit) {
@@ -320,11 +439,19 @@ for (const stat of ranked) {
   // An origin that owns a sliver of the blamed lines is usually a file the fix
   // brushed, not the change that caused the bug. Presence is still measured and
   // reported, but it may not on its own assert that a reviewer had the bug.
-  const shareOk = stat.share === null ? false : stat.share >= minShare;
+  const shareOk = minShare <= 0 ? true : stat.share !== null && stat.share >= minShare;
   if (!shareOk) {
     warn(
       `origin ${stat.sha.slice(0, 10)} owns ${Math.round((stat.share || 0) * 100)}% of blamed lines ` +
         `(below --min-share ${minShare}); its reviewer opportunities are reported as unmeasured`,
+    );
+  }
+
+  if (block && block.needleKind === "declaration") {
+    warn(
+      `origin ${stat.sha.slice(0, 10)}: the only usable needle is a declaration ` +
+        `(${block.path}:${block.start}-${block.end}), not executable logic. Presence may be exact while the ` +
+        `block is not the mechanism -- read origins[].buggyBlock before writing a case.`,
     );
   }
 
@@ -379,7 +506,10 @@ for (const stat of ranked) {
         reason = "no-published-output-on-this-pr";
       } else if (commits.some((c) => c.present === null)) {
         hadOpportunity = null;
-        reason = "presence-could-not-be-established";
+        // Report the underlying cause rather than a generic one: "no usable
+        // needle" and "commit unreachable" call for different next steps.
+        const causes = [...new Set(commits.filter((c) => c.present === null).map((c) => c.reason))];
+        reason = causes.length === 1 ? causes[0] : "presence-could-not-be-established";
       } else {
         hadOpportunity = false;
         reason = "buggy-lines-absent-at-every-reviewed-commit";
@@ -416,6 +546,7 @@ for (const stat of ranked) {
     author: meta?.author || null,
     subject: meta?.subject || null,
     buggyBlock: block,
+    needleKind: block?.needleKind || null,
     rejectedBlocks,
     originPrs,
   });

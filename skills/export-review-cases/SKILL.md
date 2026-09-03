@@ -101,9 +101,13 @@ It blames the lines the fix rewrote against the tree the fix landed on, ranks th
 Four things it deliberately refuses to trace, because each one manufactured false cases in testing:
 
 - **Non-product files.** A fix almost always touches its own tests. Blaming those attributes the bug to whoever last edited a fixture, and eligibility ends up decided by a mock branch or a docstring. Tests, fixtures, docs, generated and vendored trees are skipped; you will see them as `non-product-path` in `files[]`.
-- **Insertion anchors.** A hunk that only adds lines has no pre-image, so it cannot say what was wrong. Add-only fixes therefore produce **no origin at all** — which is correct, because a bug of omission has no origin commit. Do not go looking for one.
+- **Insertion anchors.** A hunk that only adds lines has no pre-image, so it cannot say what was wrong. An add-only fix may still rank an origin from the line above the insertion, but it can never build a needle from one — so presence comes back `null` with `no-block-carrying-identifiable-code`, and the fix yields no case. That is correct: a bug of omission has no origin commit. Do not go looking for one.
 - **History artefacts.** Subtree imports, merge commits and bulk reformats own thousands of lines and have no reviewable pull request. They are excluded from ranking and listed in `historyArtefactsExcluded`.
-- **Unidentifiable needles.** The content test needs a block of real code. A comment, an import, or a lone punctuation line matches boilerplate anywhere in a large file, so a block with less than 40 characters of substantive code is rejected and listed in `origins[].rejectedBlocks`.
+- **Unidentifiable needles.** The content test needs a block of real code. A comment, an import, a decorator, or a line of prose from inside a docstring matches boilerplate anywhere in a large file, so a block with less than 40 characters of substantive code is rejected and listed in `origins[].rejectedBlocks`. Comment and docstring interiors are detected against the whole file, because a line lifted from the middle of a docstring carries no fence of its own.
+
+`origins[].needleKind` says whether the chosen block contains executable logic (`statement`) or only declarations (`declaration`) — a type alias, an interface field, a css rule. Statement needles are preferred automatically. A `declaration` needle warns, and it is the one case where presence can be exactly right while the block is not the mechanism: **read `origins[].buggyBlock` before writing that case.**
+
+Two thresholds exist and are **off by default**: `--min-lines` (1) and `--min-share` (0). Turning them up looks tempting and costs real cases — a one-line root cause inside a multi-file fix sits below any share threshold by construction, and that is the most common bug shape there is. `shareOfBlamedLines` measures how much of the fix's diff an origin wrote, which is not the same question as whether it caused the bug. Read the share; do not gate on it without a reason.
 
 Read `origins[].originPrs[].reviewers[]`:
 
@@ -130,7 +134,7 @@ node <SKILL_DIR>/scripts/collect-reviews.mjs \
 
 This adds what the shipped side gets from the fix commit: commits pushed after each finding, whether one of them touched the same file, and what humans said in reply. None of that proves the finding was a defect — teams fix nits and ignore real bugs — so it feeds adjudication rather than deciding it. On a long-lived branch where every commit touches the same large file, `followedByCommitTouchingSamePath` carries no information at all; read the commit instead.
 
-Choose which candidates to collect. On a busy repository nearly every pull request carries a review, so ranking by review count sorts nothing. Prefer pull requests where the roster disagrees — one reviewer published and another did not — and pull requests whose findings drew a human reply.
+Choose which candidates to collect. On a busy repository nearly every pull request carries a review, so review count sorts nothing; candidates are ranked by **disagreement** instead, putting pull requests where some roster reviewer stayed silent first (`rosterSilent`, and `surfaces` for which reviewer used which channel). Prefer those, and those whose findings drew a human reply.
 
 ## 5. Generate a stub, then adjudicate
 
@@ -146,7 +150,9 @@ node <SKILL_DIR>/scripts/emit-case-stub.mjs \
   --out <RUN_DIR>/cases/<caseId>.json
 ```
 
-The stub carries the repository, reviewer, origin commit and pull request, the exact reviewed commit, how presence was established, **what the reviewer actually published at that commit**, and the fix and its paths. What is left is judgement, emitted as `TODO:` strings that fail validation until they are replaced. It refuses to stub a reviewer whose `hadOpportunity` is not `true`.
+The stub carries the repository, reviewer, origin commit and pull request, the exact reviewed commit, how presence was established, **everything the reviewer published on that pull request** (flagged by whether each item landed on the reviewed commit), and the fix scoped to the file the needle came from. What is left is judgement, emitted as `TODO:` strings; the bundler rejects any case that still contains one, at any depth. It refuses to stub a reviewer whose `hadOpportunity` is not `true`.
+
+A stub is not a case. Read the fix, the origin commit, the code at the reviewed commit, and every published item before replacing a single field.
 
 Then give each stub to a worker with the exact prompt in [references/agent-prompt.md](references/agent-prompt.md). Do not paraphrase it per candidate; labels from divergent prompts do not belong in one bundle. The schema is in [references/case-schema.md](references/case-schema.md).
 
@@ -163,7 +169,7 @@ node <SKILL_DIR>/scripts/build-bundle.mjs \
   --max-per-label 25 [--label-set "missed,caught"] [--include-source]
 ```
 
-Shape validation is not enough — a case file is written by a language model and every field in it is a claim — so the bundler also reads the repository. It checks that the reviewed commit is reachable, that `origin.path` exists at `origin.sha`, that the fix pull request exists and merged, that the reviewer is on the roster, and that origin and fix are not the same pull request unless the case says so. `--skip-truth-checks` exists for an offline run and stamps the manifest as unverified; do not send an unverified bundle.
+Shape validation is not enough — a case file is written by a language model and every field in it is a claim — so the bundler also reads the repository and GitHub. It re-runs the presence test at `reviewedAt.commit`, checks that `origin.sha` really belongs to `origin.pr`, that the fix pull request exists, merged, and touched a path the case names, that every quote appears in something the reviewer actually published, that `origin.path` exists at `origin.sha`, that the reviewer is on the roster, and that no field is still a generated placeholder. `--skip-truth-checks` exists for an offline run and stamps the manifest as unverified; do not send an unverified bundle.
 
 Without `--include-source` the bundle carries links, SHAs, paths, line numbers, prose, and excerpts of the reviewer's own published output. With it, the bundle also carries the patches for the files each case names, from the origin pull request and the fix pull request only. A case whose named paths cannot be found in its pull request is **dropped**, not exported with the whole pull request attached — that fallback once put 487 files of a customer's source into a bundle built from a case that named one.
 
@@ -179,6 +185,6 @@ Say plainly, every time:
 - the window, whether it was collected completely, the author scope, and the reviewer roster;
 - how many candidates were examined to produce this many cases;
 - how many cases were rejected and why;
-- whether `ancestry` fired at all, or whether every verdict rests on the verbatim-content test;
+- whether `ancestry` fired at all, or whether every verdict rests on the verbatim-content test — `CASES.md` states this for you;
 - that add-only fixes and bugs of omission cannot appear in this bundle at all; and
 - that no recall, precision, or ranking claim can be drawn from it.

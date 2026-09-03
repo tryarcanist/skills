@@ -29,7 +29,7 @@ Watch for the fix that repairs something the fix's own pull request introduced e
 
 The trace file names the commits that wrote the lines the fix rewrote, ranked by how many lines each contributed.
 
-**Work the highest-share origin first, and check `origins[].buggyBlock` before anything else.** That block is the exact text the presence test searched for, and it is the fastest way to catch a wrong origin: if it is not code you would describe as the bug — an import, a bracket, a line from a file the fix merely brushed — the origin is wrong no matter what `hadOpportunity` says. `shareOfBlamedLines` below about a fifth is a warning sign on its own.
+**Work the highest-share origin first, and check `origins[].buggyBlock` and `origins[].needleKind` before anything else.** A `declaration` needle — a type alias, an interface field, a css rule — is the known weak spot: presence can be exactly right while the block is not the bug at all. That block is the exact text the presence test searched for, and it is the fastest way to catch a wrong origin: if it is not code you would describe as the bug — an import, a bracket, a line from a file the fix merely brushed — the origin is wrong no matter what `hadOpportunity` says. `shareOfBlamedLines` below about a fifth is a warning sign on its own.
 
 When several origins carry `hadOpportunity: true`, they are separate candidate cases, not one. Take the one whose block is the mechanism you described in step 1 and discard the rest; say in the case that you did.
 
@@ -70,6 +70,8 @@ Decide one thing: **did the reviewer name this mechanism?** Not this file, not t
 
 ### Step 5 — write the case
 
+Replace every `TODO:` in the stub. The bundler rejects a case that still contains one anywhere, so an unedited field cannot reach a customer — but a carelessly filled one can.
+
 Write `<RUN_DIR>/cases/<caseId>.json` in the shape at [case-schema.md](case-schema.md). Fill `whatWouldHaveCaughtIt` with a concrete act — the command to run, the caller to open, the two code paths to compare. If the honest answer is that only reading the file carefully would have caught it, write that; it is a real category.
 
 ---
@@ -93,7 +95,7 @@ Publish the strongest catches, not all of them. A case is worth exporting when i
 
 Write each surviving finding to `<RUN_DIR>/cases/<caseId>.json` with `verdict: "caught"` and the reviewer's own sentences in `quotes`.
 
-Set `resolution` honestly. If a commit repaired the mechanism, that is `fixed`. If the author agreed in words and filed a ticket, that is `acknowledged`, and `resolutionEvidence` must say who and where. If the team said nothing and nothing changed, it is `none` — and a finding nobody responded to is usually not worth exporting. **Never point `fix.pr` at the pull request the finding was published on** to get past validation; use `fixedInSamePr: true` when it was genuinely repaired before merge.
+Set `resolution` honestly. If a commit repaired the mechanism, that is `fixed` — including when it landed on this same pull request, in which case set `fixedInSamePr: true` and `fix.commit`, and leave `fix.pr` null. If the author agreed in words and filed a ticket, that is `acknowledged`, and `resolutionEvidence` must say who and where. If the team said nothing and nothing changed, it is `none` — and a finding nobody responded to is usually not worth exporting. **Never point `fix.pr` at the pull request the finding was published on** to get past validation; use `fixedInSamePr: true` when it was genuinely repaired before merge.
 
 ---
 

@@ -171,8 +171,14 @@ export function validateWindow(since, until) {
   for (const [name, value] of [["--since", since], ["--until", until]]) {
     if (!ISO_DATE.test(String(value || ""))) {
       problems.push(`${name} "${value}" is not a YYYY-MM-DD date (a zero-padded month and day are required)`);
-    } else if (Number.isNaN(Date.parse(`${value}T00:00:00Z`))) {
-      problems.push(`${name} "${value}" is not a real calendar date`);
+    } else {
+      // Date.parse rolls 2026-02-30 forward to March 2 rather than rejecting
+      // it, so the guard has to round-trip. Without this a typo produces a
+      // confidently empty, complete-looking run.
+      const parsed = new Date(`${value}T00:00:00Z`);
+      if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+        problems.push(`${name} "${value}" is not a real calendar date`);
+      }
     }
   }
   if (!problems.length && Date.parse(`${since}T00:00:00Z`) >= Date.parse(`${until}T00:00:00Z`)) {

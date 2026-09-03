@@ -28,7 +28,8 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ghJson, ghOne, makeRoster, parseArgs, warn, warnings } from "./lib/gh.mjs";
-import { assertUsableClone, ensureCommit, fileAt } from "./lib/git.mjs";
+import { assertUsableClone, blockPresentAt, ensureCommit, fileAt } from "./lib/git.mjs";
+import { fetchReviewerOutput } from "./lib/reviews.mjs";
 
 const DEFAULT_MAX_PER_LABEL = 25;
 
@@ -69,7 +70,11 @@ export function validateCase(c) {
   if (c.verdict === "missed" && resolution !== "fixed") {
     problems.push("a missed case must be resolved by a merged fix; the fix is the only proof the bug was real");
   }
-  if (resolution === "fixed") need("fix.pr", "a fixed case must name the pull request that fixed it");
+  // A finding repaired before merge has no separate fix PR. Requiring one
+  // forced genuinely-fixed cases to be recorded as merely acknowledged.
+  if (resolution === "fixed" && !c.fix?.pr && !(c.fixedInSamePr === true && c.fix?.commit)) {
+    problems.push("a fixed case must name fix.pr, or set fixedInSamePr with the fix.commit that repaired it");
+  }
   if (resolution !== "fixed" && !c.resolutionEvidence) {
     problems.push(`resolution "${resolution}" needs resolutionEvidence (who acknowledged it, and where)`);
   }
@@ -117,7 +122,50 @@ export function validateCase(c) {
     problems.push("the reviewer published at this commit but the case records none of what it said");
   }
 
+  // An unedited stub is not a case. `need()` only catches empty values, and
+  // a generated placeholder is a perfectly good non-empty string.
+  for (const at of placeholderPaths(c)) {
+    problems.push(`${at} is still the generated placeholder; a stub is not a case`);
+  }
+
   return problems;
+}
+
+// Every string an unedited stub left behind. `need()` only catches empty
+// values, and a placeholder is a perfectly good non-empty string -- which is
+// how "TODO: one line: what goes wrong" reached a customer-facing heading in
+// testing. This is the same "shape is not truth" failure the truth checks
+// exist for, reproduced inside the stub path built to reduce hand-editing.
+export function placeholderPaths(value, path = "") {
+  if (typeof value === "string") {
+    return /^TODO\b/i.test(value.trim()) ? [path || "(root)"] : [];
+  }
+  if (Array.isArray(value)) return value.flatMap((v, i) => placeholderPaths(v, `${path}[${i}]`));
+  if (value && typeof value === "object") {
+    return Object.entries(value).flatMap(([k, v]) => placeholderPaths(v, path ? `${path}.${k}` : k));
+  }
+  return [];
+}
+
+const MIN_VERIFIABLE_QUOTE = 25;
+const normalizeQuote = (text) => String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
+
+// A quote is the whole evidence of a catch, and it is the one field a language
+// model can produce out of nothing that looks entirely convincing. Every
+// segment long enough to be distinctive has to appear in what the reviewer
+// actually published.
+export function unverifiedQuotes(quotes, publishedText) {
+  const haystack = normalizeQuote(publishedText);
+  const missing = [];
+  for (const quote of quotes || []) {
+    const segments = String(quote)
+      .split(/\u2026|\.\.\.|\[\u2026\]/)
+      .map(normalizeQuote)
+      .filter((seg) => seg.length >= MIN_VERIFIABLE_QUOTE);
+    if (!segments.length) continue;
+    if (!segments.every((seg) => haystack.includes(seg))) missing.push(String(quote).slice(0, 120));
+  }
+  return missing;
 }
 
 const SEVERITY_ORDER = ["blocking", "major", "minor", "nit"];
@@ -190,6 +238,29 @@ function selfTest() {
     validateCase({ ...good, verdict: "caught", resolution: "acknowledged", fix: {},
       reviewerOutputAtThatCommit: { published: true, namedTheMechanism: true, quotes: ["q"] } })
       .includes('resolution "acknowledged" needs resolutionEvidence (who acknowledged it, and where)'), true);
+  eq("an unedited stub placeholder is fatal",
+    validateCase({ ...good, bug: { ...good.bug, summary: "TODO: one line: what goes wrong" } }),
+    ["bug.summary is still the generated placeholder; a stub is not a case"]);
+  eq("a placeholder caseId is fatal",
+    validateCase({ ...good, caseId: "TODO-9662-fix-the-crash" }),
+    ["caseId is still the generated placeholder; a stub is not a case"]);
+  eq("placeholders are found at any depth",
+    placeholderPaths({ a: { b: ["ok", "TODO: fill me"] } }), ["a.b[1]"]);
+  eq("a fixed case repaired before merge needs a commit, not a fix PR",
+    validateCase({ ...good, verdict: "caught", resolution: "fixed", fix: { commit: "abc123" }, fixedInSamePr: true,
+      reviewerOutputAtThatCommit: { published: true, namedTheMechanism: true, quotes: ["q"] } }), []);
+  eq("a fixed case with neither is fatal",
+    validateCase({ ...good, verdict: "caught", resolution: "fixed", fix: {},
+      reviewerOutputAtThatCommit: { published: true, namedTheMechanism: true, quotes: ["q"] } }),
+    ["a fixed case must name fix.pr, or set fixedInSamePr with the fix.commit that repaired it"]);
+  eq("a real quote verifies against what was published",
+    unverifiedQuotes(["the guard admits email too"], "I think the guard admits email too, which breaks the SMS-only rule."), []);
+  eq("an invented quote is caught",
+    unverifiedQuotes(["this will corrupt the ledger on retry"], "Nice work, one small nit about naming here.").length, 1);
+  eq("an ellipsised quote verifies segment by segment",
+    unverifiedQuotes(["the compound message rules cite an SMS-only tool ... gated on a predicate that also admits email"],
+      "Note the compound message rules cite an SMS-only tool, but injection is gated on a predicate that also admits email."), []);
+  eq("a quote too short to be distinctive is not checked", unverifiedQuotes(["nit"], "unrelated"), []);
   eq("an unknown severity sorts last, not first",
     selectCases([
       { caseId: "typo", verdict: "missed", bug: { severity: "Major", class: "a", boundary: "b" } },
@@ -288,11 +359,63 @@ function truthProblems(c) {
   if (!roster.isEmpty && c.reviewer && !roster.has(c.reviewer)) {
     problems.push(`reviewer "${c.reviewer}" is not on the roster (${roster.spellings.join(", ")})`);
   }
+  // The central invariant, re-tested against the code rather than trusted from
+  // the case file: were the buggy lines actually there when the reviewer ran?
+  // Everything needed is already in the case, and skipping it let a case whose
+  // reviewed commit predated the code by three months export cleanly.
+  const needle = c.provenance?.buggyBlock;
+  if (commit && needle?.block && needle?.path && ensureCommit(args.repoPath, commit)) {
+    const check = blockPresentAt(args.repoPath, commit, needle.path, needle.block);
+    if (check.present === false) {
+      problems.push(
+        `the buggy block is NOT present at reviewedAt.commit ${String(commit).slice(0, 10)} ` +
+          `(${needle.path}:${needle.start}-${needle.end}); the reviewer cannot have missed it`,
+      );
+    } else if (check.present === null) {
+      problems.push(`presence at reviewedAt.commit could not be re-established (${check.reason})`);
+    }
+  } else if (commit && c.reviewedAt?.presenceMethod === "content" && !needle?.block) {
+    problems.push("presenceMethod is content but the case carries no provenance.buggyBlock to re-check");
+  }
+
+  // Does origin.sha actually belong to origin.pr?
+  if (c.origin?.sha && c.origin?.pr) {
+    const pulls = ghJson(`repos/${args.repo}/commits/${c.origin.sha}/pulls?per_page=100`, { tolerate: true });
+    if (pulls.length && !pulls.some((pr) => pr.number === c.origin.pr)) {
+      problems.push(
+        `origin.sha ${String(c.origin.sha).slice(0, 10)} belongs to PR ${pulls.map((pr) => pr.number).join("/")}, not origin.pr ${c.origin.pr}`,
+      );
+    }
+  }
+
+  if (c.verdict === "caught" && (c.reviewerOutputAtThatCommit?.quotes || []).length && c.origin?.pr) {
+    const output = fetchReviewerOutput(args.repo, c.origin.pr, makeRoster(c.reviewer));
+    if (!output.length) {
+      problems.push(`no published output by ${c.reviewer} found on PR ${c.origin.pr} to support the quoted finding`);
+    } else {
+      const missing = unverifiedQuotes(c.reviewerOutputAtThatCommit.quotes, output.map((o) => o.body).join("\n"));
+      for (const q of missing) problems.push(`quote not found in anything ${c.reviewer} published on PR ${c.origin.pr}: "${q}"`);
+    }
+  }
+
   const resolution = c.resolution || (c.fix?.pr ? "fixed" : null);
   if (resolution === "fixed" && c.fix?.pr) {
     const pr = ghOne(`repos/${args.repo}/pulls/${c.fix.pr}`, { tolerate: true });
     if (!pr) problems.push(`fix.pr ${c.fix.pr} could not be read from ${args.repo}`);
     else if (!pr.merged_at) problems.push(`fix.pr ${c.fix.pr} is not merged, so nothing proves the bug was real`);
+    else {
+      // A real merged PR that fixed a different bug in a different file is the
+      // most plausible fabrication available, so check that the fix touched
+      // the code the case is about.
+      const claimed = [...new Set([...(c.fix.paths || []), c.origin?.path].filter(Boolean))];
+      if (claimed.length) {
+        const prFiles = ghJson(`repos/${args.repo}/pulls/${c.fix.pr}/files?per_page=100`, { tolerate: true });
+        const actual = new Set(prFiles.flatMap((f) => [f.filename, f.previous_filename].filter(Boolean)));
+        if (actual.size && !claimed.some((path) => actual.has(path))) {
+          problems.push(`fix.pr ${c.fix.pr} touches none of the paths this case names (${claimed.join(", ")})`);
+        }
+      }
+    }
   }
   return problems;
 }
@@ -307,8 +430,10 @@ if (args.repoPath) {
   }
 }
 
-const selected = selectCases(loaded, maxPerLabel).filter((c) => labelSet.includes(c.verdict));
-const notSelected = loaded.filter((c) => !selected.includes(c));
+const inLabelSet = loaded.filter((c) => labelSet.includes(c.verdict));
+const labelExcluded = loaded.filter((c) => !labelSet.includes(c.verdict));
+const selected = selectCases(inLabelSet, maxPerLabel);
+const notSelected = inLabelSet.filter((c) => !selected.includes(c));
 
 // Scoped source: the patches for the files a case actually names, from the
 // origin PR and the fix PR. Never the whole PR, never the whole repository.
@@ -353,6 +478,18 @@ if (args.includeSource) {
   }
 }
 
+// `provenance.buggyBlock.block` is verbatim repository source. SKILL.md
+// promises a no-source bundle carries none, so it is removed unless source was
+// explicitly requested. The location survives either way.
+if (!args.includeSource) {
+  for (const c of selected) {
+    if (c.provenance?.buggyBlock?.block) {
+      c.provenance.buggyBlock = { ...c.provenance.buggyBlock, block: null, blockOmitted: "source not included in this bundle" };
+    }
+    for (const r of c.provenance?.rejectedBlocks || []) delete r.block;
+  }
+}
+
 mkdirSync(args.out, { recursive: true });
 
 const counts = (list) => ({
@@ -368,7 +505,15 @@ const manifest = {
   labelSet,
   roster: roster.spellings,
   maxPerLabel,
-  counts: { loaded: counts(loaded), selected: counts(selected), rejected: rejected.length, notSelected: notSelected.length },
+  counts: {
+    loaded: counts(loaded), selected: counts(selected), rejected: rejected.length,
+    heldBackByCap: notSelected.length, excludedByLabelSet: labelExcluded.length,
+  },
+  presenceMethods: selected.reduce((acc, c) => {
+    const m = c.reviewedAt?.presenceMethod || "unknown";
+    acc[m] = (acc[m] || 0) + 1;
+    return acc;
+  }, {}),
   rejected,
   notSelected: notSelected.map((c) => ({ caseId: c.caseId, verdict: c.verdict, severity: c.bug?.severity })),
   warnings,
@@ -389,9 +534,21 @@ md.push(
 md.push(
   "Every case names the exact commit the reviewer read and how presence of the bug at that commit was established. " +
     "A case is a lower bound on what happened, not a measurement of the reviewer: this set was mined from merged fixes " +
-    "and published reviews, so bugs nobody ever fixed and reviews nobody published are invisible to it.",
+    "and published reviews, so bugs nobody ever fixed and reviews nobody published are invisible to it. " +
+    "Bugs of omission cannot appear at all, because a fix that only adds lines has no origin commit to trace.",
   "",
 );
+const methods = manifest.presenceMethods || {};
+if (!methods.ancestry) {
+  md.push(
+    "**No case here rests on commit ancestry.** This repository squash-merges, so the exact presence test cannot fire: " +
+      "the commit blame names is a squash commit on the default branch, and the commits a reviewer read live on a branch " +
+      "that is not its ancestor. Every verdict below uses the approximate verbatim-content test, which reports a " +
+      "reformatted line as absent — it loses real cases and does not invent them.",
+    "",
+  );
+}
+md.push(`Presence tests used: ${Object.entries(methods).map(([m, n]) => `${m} ${n}`).join(", ") || "none"}.`, "");
 for (const label of ["missed", "caught"]) {
   const list = selected.filter((c) => c.verdict === label);
   if (!list.length) continue;
@@ -399,9 +556,20 @@ for (const label of ["missed", "caught"]) {
   for (const c of list) {
     md.push(`### ${c.caseId} — ${c.bug?.summary || "(no summary)"}`, "");
     md.push(`- Severity: ${c.bug?.severity || "?"} · class: ${c.bug?.class || "?"} · boundary: ${c.bug?.boundary || "?"}`);
-    if (c.origin?.pr) md.push(`- Introduced by PR [#${c.origin.pr}](${c.origin.url || ""}) at \`${(c.origin.sha || "").slice(0, 10)}\`${c.origin.path ? ` (\`${c.origin.path}\`)` : ""}`);
+    if (c.origin?.pr) {
+      // For a caught case the reviewer's finding was published on this pull
+      // request; calling that "introduced by" misreads the case entirely.
+      const role = c.verdict === "caught" ? "Reported on PR" : "Introduced by PR";
+      md.push(`- ${role} [#${c.origin.pr}](${c.origin.url || ""})${c.origin.sha ? ` at \`${String(c.origin.sha).slice(0, 10)}\`` : ""}${c.origin.path ? ` (\`${c.origin.path}\`)` : ""}`);
+    }
     md.push(`- Reviewed by \`${c.reviewer}\` at \`${String(c.reviewedAt?.commit || "").slice(0, 10)}\` (presence established by ${c.reviewedAt?.presenceMethod})`);
-    if (c.fix?.pr) md.push(`- Fixed by PR [#${c.fix.pr}](${c.fix.url || ""})${c.fix.mergedAt ? ` merged ${c.fix.mergedAt}` : ""}`);
+    const resolution = c.resolution || (c.fix?.pr ? "fixed" : "unstated");
+    if (c.fix?.pr) md.push(`- Resolution: ${resolution} — PR [#${c.fix.pr}](${c.fix.url || ""})${c.fix.mergedAt ? ` merged ${c.fix.mergedAt}` : ""}`);
+    else if (c.fixedInSamePr && c.fix?.commit) md.push(`- Resolution: ${resolution} before merge, in \`${String(c.fix.commit).slice(0, 10)}\``);
+    else md.push(`- Resolution: ${resolution}${c.resolutionEvidence ? ` — ${c.resolutionEvidence}` : ""}`);
+    if (c.provenance?.buggyBlock?.needleKind === "declaration") {
+      md.push(`- Presence was established from a declaration rather than executable logic; read the block before relying on this case.`);
+    }
     md.push("");
     if (c.bug?.mechanism) md.push(`**Mechanism.** ${c.bug.mechanism}`, "");
     if (c.bug?.trigger) md.push(`**Trigger.** ${c.bug.trigger}`, "");
