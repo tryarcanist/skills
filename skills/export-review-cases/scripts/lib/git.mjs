@@ -162,40 +162,57 @@ export function blockPresentAt(repoPath, rev, path, block) {
 }
 
 // Pre-image line ranges touched by a unified diff patch, i.e. the lines that
-// existed before the fix and therefore carry the bug's authorship. A hunk that
-// only adds lines has no pre-image range of its own; we return the single line
-// above the insertion point so blame still has an anchor, flagged so the
-// adjudicator knows the attribution is weaker.
+// existed before the fix and therefore carry the bug's authorship.
+//
+// Two kinds come out of this, and conflating them was the defect that produced
+// false eligibility verdicts in testing:
+//
+//   deletion  Lines the fix removed or rewrote. These carry the mechanism, and
+//             only these may be used as a presence needle.
+//   anchor    The line above a pure insertion. A hunk that only adds lines has
+//             no pre-image of its own, so this is a weak locator for "roughly
+//             where the fix went" and nothing more. One per insertion run --
+//             an earlier version emitted one per added line, which let a
+//             twenty-line insertion cast twenty votes for whoever wrote the
+//             line above it, and let add-heavy fixes manufacture origins whole.
 export function preImageRanges(patch) {
   const ranges = [];
   if (!patch) return ranges;
-  const lines = patch.split("\n");
   let oldLine = 0;
   let pendingStart = null;
   let pendingEnd = null;
+  let inInsertionRun = false;
   const flush = () => {
-    if (pendingStart !== null) ranges.push({ start: pendingStart, end: pendingEnd, anchorOnly: false });
+    if (pendingStart !== null) {
+      ranges.push({ start: pendingStart, end: pendingEnd, kind: "deletion", anchorOnly: false });
+    }
     pendingStart = null;
     pendingEnd = null;
   };
-  for (const line of lines) {
+  for (const line of patch.split("\n")) {
     const hunk = /^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@/.exec(line);
     if (hunk) {
       flush();
       oldLine = Number(hunk[1]);
+      inInsertionRun = false;
       continue;
     }
     if (line.startsWith("-")) {
       if (pendingStart === null) pendingStart = oldLine;
       pendingEnd = oldLine;
       oldLine += 1;
+      inInsertionRun = false;
     } else if (line.startsWith("+")) {
-      if (pendingStart === null && oldLine > 1) {
-        ranges.push({ start: oldLine - 1, end: oldLine - 1, anchorOnly: true });
+      // Only the first added line of a run anchors, and only when the run does
+      // not already sit inside a deletion range that carries the real content.
+      if (pendingStart === null && !inInsertionRun && oldLine > 1) {
+        ranges.push({ start: oldLine - 1, end: oldLine - 1, kind: "anchor", anchorOnly: true });
       }
+      inInsertionRun = true;
     } else if (line.startsWith(" ")) {
       flush();
       oldLine += 1;
+      inInsertionRun = false;
     }
   }
   flush();

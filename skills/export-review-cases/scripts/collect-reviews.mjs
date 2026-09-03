@@ -135,9 +135,11 @@ const out = {
     body: pr.body || "",
   },
   commits: commits.map(({ files, ...rest }) => rest),
-  reviewersWithoutOutput: roster.logins.filter(
-    (l) => !output.some((o) => normalizeLogin(o.reviewer) === l),
-  ),
+  // The roster's own spelling, so one file never carries both "cursor" and
+  // "cursor[bot]" for the same identity.
+  reviewersWithoutOutput: roster.logins
+    .filter((l) => !output.some((o) => normalizeLogin(o.reviewer) === l))
+    .map((l) => roster.spell(l)),
   findings,
   humanReplies,
   humanComments,

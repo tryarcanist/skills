@@ -24,13 +24,24 @@ export function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// A permanent answer is not a transient failure. Retrying a 404 three times
+// costs six seconds of sleep to learn what the first response already said.
+export function isPermanentFailure(detail) {
+  const text = String(detail || "");
+  if (/rate limit|abuse detection|retry-after|was submitted too quickly/i.test(text)) return false;
+  return /HTTP 40[0134]|HTTP 422|Not Found|no such|Could not resolve to/i.test(text);
+}
+
 export function runGh(ghArgs) {
   let detail = "";
+  let attempts = 0;
   for (let attempt = 0; attempt < GH_ATTEMPTS; attempt += 1) {
+    attempts = attempt + 1;
     try {
       return execFileSync("gh", ghArgs, { encoding: "utf8", maxBuffer: MAX_BUFFER });
     } catch (e) {
       detail = (e.stderr || e.message || "").toString().trim().slice(0, 300);
+      if (isPermanentFailure(detail)) break;
       if (attempt === GH_ATTEMPTS - 1) break;
       const secondary =
         /secondary rate limit|abuse detection|was submitted too quickly|rate limit exceeded|retry-after/i.test(
@@ -48,6 +59,8 @@ export function runGh(ghArgs) {
   }
   const err = new Error(detail || "gh failed");
   err.detail = detail;
+  err.attempts = attempts;
+  err.permanent = isPermanentFailure(detail);
   throw err;
 }
 
@@ -71,7 +84,7 @@ export function ghJson(path, { tolerate = false } = {}) {
   } catch (e) {
     const detail = e.detail || e.message || "";
     if (tolerate) {
-      warn(`GET ${path} failed after ${GH_ATTEMPTS} attempt(s) and was treated as empty: ${detail}`);
+      warn(`GET ${path} failed after ${e.attempts || 1} attempt(s)${e.permanent ? " (permanent)" : ""} and was treated as empty: ${detail}`);
       return [];
     }
     process.stderr.write(`gh api ${path} failed: ${detail}\n`);
@@ -91,7 +104,7 @@ export function ghOne(path, { tolerate = false } = {}) {
   } catch (e) {
     const detail = e.detail || e.message || "";
     if (tolerate) {
-      warn(`GET ${path} failed after ${GH_ATTEMPTS} attempt(s) and was treated as missing: ${detail}`);
+      warn(`GET ${path} failed after ${e.attempts || 1} attempt(s)${e.permanent ? " (permanent)" : ""} and was treated as missing: ${detail}`);
       return null;
     }
     process.stderr.write(`gh api ${path} failed: ${detail}\n`);
@@ -129,14 +142,41 @@ export function normalizeLogin(login) {
     .replace(/\[bot\]$/, "");
 }
 
+// Keeps both spellings. `logins` is normalised for comparison; `spellings`
+// preserves what the operator typed, so an output file never mixes "cursor"
+// and "cursor[bot]" for the same identity in the same array.
 export function makeRoster(only) {
-  const logins = String(only || "")
+  const spellings = String(only || "")
     .split(",")
-    .map((s) => normalizeLogin(s.trim()))
+    .map((s) => s.trim())
     .filter(Boolean);
+  const logins = spellings.map(normalizeLogin);
+  const spellingFor = new Map(logins.map((l, i) => [l, spellings[i]]));
   return {
     logins,
+    spellings,
     has: (login) => logins.includes(normalizeLogin(login)),
+    // The roster's own spelling for a login, so placeholder rows match real ones.
+    spell: (login) => spellingFor.get(normalizeLogin(login)) || login,
     isEmpty: logins.length === 0,
   };
+}
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+// A mistyped date and a genuinely empty window produce identical GitHub
+// results, so the typo has to be caught here or it is never caught at all.
+export function validateWindow(since, until) {
+  const problems = [];
+  for (const [name, value] of [["--since", since], ["--until", until]]) {
+    if (!ISO_DATE.test(String(value || ""))) {
+      problems.push(`${name} "${value}" is not a YYYY-MM-DD date (a zero-padded month and day are required)`);
+    } else if (Number.isNaN(Date.parse(`${value}T00:00:00Z`))) {
+      problems.push(`${name} "${value}" is not a real calendar date`);
+    }
+  }
+  if (!problems.length && Date.parse(`${since}T00:00:00Z`) >= Date.parse(`${until}T00:00:00Z`)) {
+    problems.push(`--since ${since} is not before --until ${until} (--until is exclusive)`);
+  }
+  return problems;
 }

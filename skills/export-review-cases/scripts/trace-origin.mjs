@@ -31,7 +31,7 @@
 //   trace-origin.mjs --self-test
 
 import { writeFileSync } from "node:fs";
-import { ghJson, ghOne, makeRoster, parseArgs, warn, warnings } from "./lib/gh.mjs";
+import { ghJson, ghOne, makeRoster, normalizeLogin, parseArgs, warn, warnings } from "./lib/gh.mjs";
 import {
   assertUsableClone, blameLines, blockPresentAt, commitMeta, contiguousRuns,
   ensureCommit, fileAt, git, isAncestor, preImageRanges,
@@ -40,16 +40,48 @@ import { fetchReviewerOutput, reviewedCommitsByReviewer } from "./lib/reviews.mj
 
 const DEFAULT_MAX_ORIGINS = 5;
 const DEFAULT_MIN_LINES = 2;
+const DEFAULT_MIN_SHARE = 0.1;
+const MIN_BLOCK_CHARS = 40;
 
 // Files whose blame says nothing about who introduced a defect.
 const UNINFORMATIVE_PATH =
   /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Cargo\.lock|go\.sum|composer\.lock)$|\.(snap|lock|svg|png|jpe?g|gif|ico|pdf|min\.js|min\.css)$/i;
 
+// Non-product files. A fix almost always touches its own tests, and blaming
+// those tests attributes the bug to whoever last edited a fixture. In testing
+// this produced eligibility verdicts decided by a mock branch, a docstring and
+// a bare comment -- charging reviewers with missing bugs in files that did not
+// exist when they ran. The mechanism lives in product code; nothing else is
+// traced.
+const NON_PRODUCT_PATH =
+  /(^|\/)(tests?|__tests__|spec|specs|e2e|integration_tests|fixtures?|testdata|test_data|mocks?|__mocks__|docs?|examples?|samples?|vendor|third_party|node_modules|generated|__generated__|\.github)\/|(^|\/)(MIGRATION_HISTORY|CHANGELOG|README)[^/]*$|\.(test|spec)\.[jt]sx?$|(^|\/)test_[^/]*\.py$|_test\.(go|py|rb)$|\.stories\.[jt]sx?$/i;
+
+// Commits that rewrote history rather than wrote code. A subtree import or a
+// merge commit can own thousands of lines and has no reviewable pull request.
+const HISTORY_ARTIFACT_SUBJECT =
+  /^(squashed '.*' (content|changes)|merge (branch|pull request|remote-tracking|commit)|initial commit|import(ing)? |bulk (re)?format|apply (prettier|black|gofmt)|migrate to |rename .* directory)/i;
+
+// Lines that appear in every large file and therefore identify nothing.
+const NOISE_LINE =
+  /^\s*(?:\/\/|#(?!\s*(?:if|include|define))|\*|\/\*|--|<!--|"{3}|'{3}|import\s|from\s+\S+\s+import\s|export\s*\{|use\s+\w|package\s+\w|require\(|@\w+\s*$|[{}()\[\];,]*$)/;
+
+// How much of a block is actually distinguishing code, after dropping comments,
+// imports, docstrings and punctuation-only lines. A needle made of boilerplate
+// answers the presence question by accident, in whichever direction the file
+// happens to fall.
+export function substantiveLength(block) {
+  return String(block || "")
+    .split("\n")
+    .filter((l) => l.trim().length > 0 && !NOISE_LINE.test(l))
+    .map((l) => l.trim().replace(/\s+/g, " "))
+    .join("\n").length;
+}
+
 function usage(msg) {
   if (msg) process.stderr.write(`error: ${msg}\n`);
   process.stderr.write(
     "usage: trace-origin.mjs --repo owner/repo --pr <fix-pr> --only \"bot-a,bot-b\"\n" +
-      "                       [--repo-path .] [--max-origins N] [--min-lines N] --out file\n" +
+      "                       [--repo-path .] [--max-origins N] [--min-lines N] [--min-share 0.1] --out file\n" +
       "       trace-origin.mjs --self-test\n",
   );
   process.exit(2);
@@ -65,6 +97,18 @@ function selfTest() {
   eq("a squash subject yields its PR number", squashPrNumber("Fix stale cache key (#13375)"), 13375);
   eq("a subject without a PR number yields null", squashPrNumber("Fix stale cache key"), null);
   eq("only the trailing PR reference is used", squashPrNumber("Revert (#10) broke things (#4200)"), 4200);
+  eq("test and fixture paths are not traced",
+    ["core/tests/api/test_x.py", "src/__tests__/a.ts", "web/a.test.tsx", "docs/guide.md", "core/migrations/MIGRATION_HISTORY", "pkg/thing_test.go"].map((f) => NON_PRODUCT_PATH.test(f)),
+    [true, true, true, true, true, true]);
+  eq("product paths are still traced",
+    ["core/src/lib/latest.py", "apps/worker/src/protest.ts", "src/contest/index.ts"].map((f) => NON_PRODUCT_PATH.test(f)),
+    [false, false, false]);
+  eq("a subtree import is a history artefact", HISTORY_ARTIFACT_SUBJECT.test("Squashed 'core/' content from commit 37b26f93"), true);
+  eq("a normal fix subject is not", HISTORY_ARTIFACT_SUBJECT.test("Fix stale cache key after fallback"), false);
+  eq("an import line is not substantive", substantiveLength('import { a, b, c } from "some/long/module/path";'), 0);
+  eq("a comment line is not substantive", substantiveLength("// Yield so the first run entered the workflow and claimed the slot."), 0);
+  eq("a docstring line is not substantive", substantiveLength('"""Create an organization in the database for integration tests."""'), 0);
+  eq("real code is substantive", substantiveLength("if (!member) return { ok: true };\n  ledger.record(member.id, now);") >= MIN_BLOCK_CHARS, true);
 
   for (const c of cases) process.stdout.write(`${c.ok ? "ok  " : "FAIL"} ${c.name}\n`);
   const failed = cases.filter((c) => !c.ok);
@@ -82,7 +126,7 @@ function squashPrNumber(subject) {
 
 const args = parseArgs(process.argv.slice(2), {
   repo: "value", pr: "value", only: "value", repoPath: "value",
-  maxOrigins: "value", minLines: "value", out: "value", selfTest: "flag",
+  maxOrigins: "value", minLines: "value", minShare: "value", out: "value", selfTest: "flag",
 });
 if (args.error) usage(args.error);
 if (args.selfTest) selfTest();
@@ -94,6 +138,7 @@ if (!args.out) usage("--out is required");
 const repoPath = args.repoPath || ".";
 const maxOrigins = Number(args.maxOrigins || DEFAULT_MAX_ORIGINS);
 const minLines = Number(args.minLines || DEFAULT_MIN_LINES);
+const minShare = args.minShare === undefined ? DEFAULT_MIN_SHARE : Number(args.minShare);
 const roster = makeRoster(args.only);
 const prNum = String(args.pr).match(/(\d+)(?!.*\d)/)?.[1];
 if (!prNum) usage(`could not read a PR number from ${args.pr}`);
@@ -102,7 +147,17 @@ assertUsableClone(repoPath);
 
 const fixPr = ghOne(`repos/${args.repo}/pulls/${prNum}`);
 if (!fixPr) usage(`PR ${prNum} could not be read`);
-if (!fixPr.merged_at) warn(`PR ${prNum} is not merged; a fix that never landed is weak ground truth`);
+// The first invariant is that the fix is the ground truth. An unmerged PR has
+// no merge commit in the repository's history -- `merge_commit_sha` is
+// GitHub's ephemeral test-merge -- so everything downstream would be traced
+// against a tree that exists on no branch.
+if (!fixPr.merged_at) {
+  process.stderr.write(
+    `error: PR ${prNum} is not merged. Nothing landed, so there is no evidence a bug was ever real, ` +
+      `and no merge commit to blame against. Pick a merged fix.\n`,
+  );
+  process.exit(2);
+}
 
 // Blame must run against the tree the fix was applied to. Blaming the fix
 // itself, or current head, names the fix as the author of its own bug.
@@ -139,6 +194,10 @@ for (const file of files) {
     fileObservations.push({ path: file.filename, prePath, status: file.status, state: "uninformative-path" });
     continue;
   }
+  if (NON_PRODUCT_PATH.test(prePath)) {
+    fileObservations.push({ path: file.filename, prePath, status: file.status, state: "non-product-path" });
+    continue;
+  }
   if (!file.patch) {
     fileObservations.push({ path: file.filename, prePath, status: file.status, state: "no-patch-returned" });
     continue;
@@ -161,17 +220,32 @@ for (const file of files) {
       stat.lines += 1;
       stat.boundary = stat.boundary || entry.boundary;
     }
-    for (const stat of originStats.values()) {
-      const runs = contiguousRuns(blamed, stat.sha);
-      if (runs.length) stat.evidence.push({ path: prePath, runs, anchorOnly: range.anchorOnly });
+    // Only the commits this range actually blames to. Walking every origin
+    // accumulated so far made evidence collection quadratic in origin count.
+    for (const sha of new Set(blamed.map((b) => b.sha))) {
+      const runs = contiguousRuns(blamed, sha);
+      if (runs.length) originStats.get(sha).evidence.push({ path: prePath, runs, anchorOnly: range.anchorOnly });
     }
   }
   fileObservations.push({ path: file.filename, prePath, status: file.status, state: "observed", ranges: observed });
 }
 
 const totalBlamedLines = [...originStats.values()].reduce((n, s) => n + s.lines, 0);
+for (const stat of originStats.values()) {
+  const meta = commitMeta(repoPath, stat.sha);
+  stat.subject = meta?.subject || null;
+  stat.meta = meta;
+  stat.share = totalBlamedLines ? Number((stat.lines / totalBlamedLines).toFixed(3)) : null;
+  stat.historyArtifact = HISTORY_ARTIFACT_SUBJECT.test(stat.subject || "");
+}
+
+const artefacts = [...originStats.values()].filter((x) => x.historyArtifact);
+for (const a of artefacts) {
+  warn(`origin ${a.sha.slice(0, 10)} is a history artefact (${a.subject}); excluded from ranking`);
+}
+
 const ranked = [...originStats.values()]
-  .filter((s) => s.lines >= minLines)
+  .filter((x) => x.lines >= minLines && !x.historyArtifact)
   .sort((a, b) => b.lines - a.lines)
   .slice(0, maxOrigins);
 
@@ -182,31 +256,42 @@ if (ranked.some((s) => s.boundary)) {
 // Extract the buggy block from the tree the fix was applied to. This is the
 // text the content-presence test looks for at each reviewed commit.
 //
-// Pick the longest contiguous run the origin owns, not the first one found. A
-// one-line needle is the failure mode here: it matches boilerplate anywhere in
-// a large file and it stops matching after any cosmetic edit, so a block that
-// is too small to identify anything is reported as unusable rather than
-// silently answering the presence question wrong in either direction.
-const MIN_BLOCK_CHARS = 40;
-
+// Only a deletion range may supply it. An anchor range is the line above a pure
+// insertion -- it locates roughly where a fix went, and says nothing about what
+// was wrong. Using one as a needle is how an unrelated import line came to
+// decide, in testing, that two reviewers had opposite eligibility for the same
+// bug on the same pull request while the rewritten line was identical at both
+// of their commits.
+//
+// The block must also carry real code. A needle made of comments, imports or
+// docstrings matches boilerplate anywhere in a large file, so it answers the
+// presence question by accident.
 function bestBlock(stat) {
   const options = [];
   for (const ev of stat.evidence) {
-    for (const run of ev.runs) options.push({ path: ev.path, run, anchorOnly: ev.anchorOnly });
+    if (ev.anchorOnly) continue;
+    for (const run of ev.runs) options.push({ path: ev.path, run });
   }
   options.sort((a, b) => b.run.end - b.run.start - (a.run.end - a.run.start));
+  const rejected = [];
   for (const option of options) {
     const content = fileAt(repoPath, preFixSha, option.path);
     if (content === null) continue;
     const block = content.split("\n").slice(option.run.start - 1, option.run.end).join("\n");
-    const weight = block.replace(/\s+/g, " ").trim().length;
-    if (weight < MIN_BLOCK_CHARS) continue;
+    const weight = substantiveLength(block);
+    if (weight < MIN_BLOCK_CHARS) {
+      rejected.push({ path: option.path, start: option.run.start, end: option.run.end, substantiveChars: weight });
+      continue;
+    }
     return {
-      path: option.path, start: option.run.start, end: option.run.end,
-      block, anchorOnly: option.anchorOnly, lines: option.run.end - option.run.start + 1,
+      block: {
+        path: option.path, start: option.run.start, end: option.run.end,
+        block, substantiveChars: weight, lines: option.run.end - option.run.start + 1,
+      },
+      rejected,
     };
   }
-  return null;
+  return { block: null, rejected };
 }
 
 function presenceAt(stat, block, reviewedCommit) {
@@ -215,7 +300,7 @@ function presenceAt(stat, block, reviewedCommit) {
   }
   const ancestry = isAncestor(repoPath, stat.sha, reviewedCommit);
   if (ancestry === true) return { present: true, method: "ancestry", reason: null };
-  if (!block) return { present: null, method: "unmeasurable", reason: "no-block-large-enough-to-identify" };
+  if (!block) return { present: null, method: "unmeasurable", reason: "no-block-carrying-identifiable-code" };
   const content = blockPresentAt(repoPath, reviewedCommit, block.path, block.block);
   if (content.present === null) return { present: null, method: "unmeasurable", reason: content.reason };
   return {
@@ -226,14 +311,27 @@ function presenceAt(stat, block, reviewedCommit) {
 }
 
 const origins = [];
+const presenceMethodCounts = { ancestry: 0, content: 0, unmeasurable: 0 };
+
 for (const stat of ranked) {
-  const meta = commitMeta(repoPath, stat.sha);
-  const block = bestBlock(stat);
+  const meta = stat.meta;
+  const { block, rejected: rejectedBlocks } = bestBlock(stat);
+
+  // An origin that owns a sliver of the blamed lines is usually a file the fix
+  // brushed, not the change that caused the bug. Presence is still measured and
+  // reported, but it may not on its own assert that a reviewer had the bug.
+  const shareOk = stat.share === null ? false : stat.share >= minShare;
+  if (!shareOk) {
+    warn(
+      `origin ${stat.sha.slice(0, 10)} owns ${Math.round((stat.share || 0) * 100)}% of blamed lines ` +
+        `(below --min-share ${minShare}); its reviewer opportunities are reported as unmeasured`,
+    );
+  }
 
   const associated = ghJson(`repos/${args.repo}/commits/${stat.sha}/pulls?per_page=100`, { tolerate: true });
-  let originPrs = associated.map((p) => ({
-    number: p.number, title: p.title, url: p.html_url,
-    author: p.user?.login || null, mergedAt: p.merged_at || null, source: "commit-pulls-api",
+  let originPrs = associated.map((pr) => ({
+    number: pr.number, title: pr.title, url: pr.html_url,
+    author: pr.user?.login || null, mergedAt: pr.merged_at || null, source: "commit-pulls-api",
   }));
   if (originPrs.length === 0) {
     const guessed = squashPrNumber(meta?.subject);
@@ -251,24 +349,58 @@ for (const stat of ranked) {
     }
     const output = fetchReviewerOutput(args.repo, originPr.number, roster);
     originPr.reviewerOutput = output;
+    const seen = new Set();
     originPr.reviewers = reviewedCommitsByReviewer(output).map((r) => {
-      const commits = r.reviewedCommits.map((c) => ({ ...c, ...presenceAt(stat, block, c.sha) }));
+      seen.add(normalizeLogin(r.reviewer));
+      const commits = r.reviewedCommits.map((c) => {
+        const result = presenceAt(stat, block, c.sha);
+        presenceMethodCounts[result.method === "unmeasurable" ? "unmeasurable" : result.method] += 1;
+        return { ...c, ...result };
+      });
       const withOpportunity = commits.filter((c) => c.present === true);
+
+      // Three distinct negatives that must not collapse into one. A reviewer
+      // that published only on an unpinned surface cannot be placed on any
+      // commit, so nothing is known about what it saw -- reporting that as
+      // `false` reads as "it ran and the bug was not there yet", which is a
+      // different and unearned claim.
+      let hadOpportunity;
+      let reason = null;
+      if (!shareOk) {
+        hadOpportunity = null;
+        reason = "origin-share-below-threshold";
+      } else if (withOpportunity.length > 0) {
+        hadOpportunity = true;
+      } else if (commits.length === 0 && r.unpinnedPublications > 0) {
+        hadOpportunity = null;
+        reason = "published-only-on-an-unpinned-surface";
+      } else if (commits.length === 0) {
+        hadOpportunity = false;
+        reason = "no-published-output-on-this-pr";
+      } else if (commits.some((c) => c.present === null)) {
+        hadOpportunity = null;
+        reason = "presence-could-not-be-established";
+      } else {
+        hadOpportunity = false;
+        reason = "buggy-lines-absent-at-every-reviewed-commit";
+      }
+
       return {
-        reviewer: r.reviewer,
+        reviewer: roster.spell(r.reviewer),
+        publishedAs: r.reviewer,
         reviewedCommits: commits,
         unpinnedPublications: r.unpinnedPublications,
-        hadOpportunity: withOpportunity.length > 0
-          ? true
-          : commits.some((c) => c.present === null) ? null : false,
+        hadOpportunity,
+        reason,
         firstOpportunity: withOpportunity[0] || null,
       };
     });
     for (const login of roster.logins) {
-      if (!originPr.reviewers.some((r) => r.reviewer.toLowerCase().replace(/\[bot\]$/, "") === login)) {
+      if (!seen.has(login)) {
         originPr.reviewers.push({
-          reviewer: login, reviewedCommits: [], unpinnedPublications: 0,
-          hadOpportunity: false, firstOpportunity: null, note: "no published output on this PR",
+          reviewer: roster.spell(login), publishedAs: null,
+          reviewedCommits: [], unpinnedPublications: 0,
+          hadOpportunity: false, reason: "no-published-output-on-this-pr", firstOpportunity: null,
         });
       }
     }
@@ -277,14 +409,23 @@ for (const stat of ranked) {
   origins.push({
     sha: stat.sha,
     lines: stat.lines,
-    shareOfBlamedLines: totalBlamedLines ? Number((stat.lines / totalBlamedLines).toFixed(3)) : null,
+    shareOfBlamedLines: stat.share,
+    shareAboveThreshold: shareOk,
     boundary: stat.boundary,
     authoredAt: meta?.authoredAt || null,
     author: meta?.author || null,
     subject: meta?.subject || null,
     buggyBlock: block,
+    rejectedBlocks,
     originPrs,
   });
+}
+
+if (presenceMethodCounts.ancestry === 0 && presenceMethodCounts.content > 0) {
+  warn(
+    "ancestry never fired: every presence verdict in this trace rests on the approximate verbatim-content test. " +
+      "This is expected on a squash-merge repository and means a reformatted line reads as absent.",
+  );
 }
 
 const out = {
@@ -301,6 +442,9 @@ const out = {
   preFix: { sha: preFixSha, source: preFixSource },
   files: fileObservations,
   totalBlamedLines,
+  thresholds: { maxOrigins, minLines, minShare, minBlockChars: MIN_BLOCK_CHARS },
+  presenceMethodCounts,
+  historyArtefactsExcluded: artefacts.map((a) => ({ sha: a.sha, lines: a.lines, subject: a.subject })),
   origins,
   warnings,
   generatedAt: new Date().toISOString(),

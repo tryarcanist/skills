@@ -8,7 +8,9 @@ Three prompts. Fill in `<REPO>`, `<RUN_DIR>`, `<SKILL_DIR>`, and the identifiers
 
 You are deciding whether one merged fix should become a case about an AI code reviewer. You have no stake in the reviewer looking good or bad, and "no case here" is a correct and common answer.
 
-**Repo:** `<REPO>` **Fix PR:** `<FIX_PR>` **Trace:** `<RUN_DIR>/origins/<FIX_PR>.json`
+**Repo:** `<REPO>` **Fix PR:** `<FIX_PR>` **Trace:** `<RUN_DIR>/origins/<FIX_PR>.json` **Stub:** `<STUB_PATH>`
+
+Your stub is already filled in with everything the tooling knows. Replace the `TODO:` fields and leave the rest alone.
 
 ### Step 1 — establish that a real bug shipped
 
@@ -27,6 +29,10 @@ Watch for the fix that repairs something the fix's own pull request introduced e
 
 The trace file names the commits that wrote the lines the fix rewrote, ranked by how many lines each contributed.
 
+**Work the highest-share origin first, and check `origins[].buggyBlock` before anything else.** That block is the exact text the presence test searched for, and it is the fastest way to catch a wrong origin: if it is not code you would describe as the bug — an import, a bracket, a line from a file the fix merely brushed — the origin is wrong no matter what `hadOpportunity` says. `shareOfBlamedLines` below about a fifth is a warning sign on its own.
+
+When several origins carry `hadOpportunity: true`, they are separate candidate cases, not one. Take the one whose block is the mechanism you described in step 1 and discard the rest; say in the case that you did.
+
 Blame names who last touched a line, which is not always who caused the bug. Check the top origin yourself:
 
 ```bash
@@ -40,7 +46,7 @@ Ask whether that change actually introduced the mechanism you described in step 
 Read `origins[].originPrs[].reviewers[]` in the trace file.
 
 - `hadOpportunity: false` — write `verdict: "not_eligible"`. Do not argue around this. A reviewer that ran before the buggy lines existed did not miss them, and a case that says otherwise teaches a reviewer to find bugs that were not there.
-- `hadOpportunity: null` — write `verdict: "not_eligible"` with the reason recorded. Unmeasured is not guilty.
+- `hadOpportunity: null` — write `verdict: "not_eligible"` and copy the `reason`. Unmeasured is not guilty. `published-only-on-an-unpinned-surface` in particular means the reviewer *did* publish, and nothing at all is known about which commit it saw; it is not evidence of anything in either direction.
 - `hadOpportunity: true` — continue, and carry `firstOpportunity.sha` into `reviewedAt.commit`.
 
 Confirm it yourself at that commit:
@@ -76,6 +82,7 @@ Same standing, same detachment. A reviewer's own comment chose this subject, so 
 
 For each finding in the file:
 
+0. If the finding carries `bodyTruncated: true`, refetch the full comment before you judge it. Some reviewers publish one very long walkthrough, and the mechanism you are looking for may be past the cut.
 1. Read the code at the finding's `reviewedCommit` — never at head. GitHub re-anchors comment lines as a pull request evolves, so the line the comment points at today may not be the line it was written against.
 2. Decide whether a **reachable wrong output or violated contract** was really there. A real mechanism that produces no material harm is `not_a_bug` for this bundle, even when the team fixed it. So is a correct-sounding claim that the code disproves.
 3. Re-rate the severity yourself. Reviewers rarely invent a bug; they routinely over-rate one. A real bug labelled critical that is really a nit is still a catch, at nit severity.
@@ -85,6 +92,8 @@ For each finding in the file:
 Publish the strongest catches, not all of them. A case is worth exporting when it shows something a reviewer had to reason about — a cross-boundary contract, a state that only exists at runtime, a failure the diff alone does not reveal. Twelve variations on a missing null check are one case.
 
 Write each surviving finding to `<RUN_DIR>/cases/<caseId>.json` with `verdict: "caught"` and the reviewer's own sentences in `quotes`.
+
+Set `resolution` honestly. If a commit repaired the mechanism, that is `fixed`. If the author agreed in words and filed a ticket, that is `acknowledged`, and `resolutionEvidence` must say who and where. If the team said nothing and nothing changed, it is `none` — and a finding nobody responded to is usually not worth exporting. **Never point `fix.pr` at the pull request the finding was published on** to get past validation; use `fixedInSamePr: true` when it was genuinely repaired before merge.
 
 ---
 
@@ -99,6 +108,7 @@ Inspect the code yourself. Do not accept the case's own summary of it.
 For a `missed` case, try to establish any one of these:
 
 - the buggy lines were **not** present at `reviewedAt.commit` — check the file at that commit and read it, rather than trusting the presence method;
+- the presence needle in `provenance.buggyBlock` is not the bug — an import, a comment, a bracket, or a line from a file the fix merely brushed. A verdict resting on a needle like that is wrong even when the tooling returned `true`;
 - the reviewer **did** name the mechanism somewhere in its published output, including inside a long summary body;
 - the origin is wrong, and the mechanism arrived in a different change;
 - the fix was not repairing a defect — it was a refactor, a hardening pass, or a product change;
@@ -108,7 +118,7 @@ For a `caught` case, try to establish that the quoted finding does not describe 
 
 Then set `skeptic` on the case:
 
-- `upheld` — you tried the above and the case survived. Say what you checked.
+- `upheld` — you tried the above and the case survived. **Say what you checked**, specifically enough that someone could repeat it. An empty note blocks export, because an upheld verdict with nothing behind it is worse than no skeptic pass at all.
 - `revised` — the case is real but a field was wrong. Correct the field and say which.
 - `rejected` — the case does not hold. It will not be exported.
 

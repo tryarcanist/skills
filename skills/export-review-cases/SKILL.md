@@ -7,8 +7,8 @@ description: Build a shareable case set of bugs an AI code reviewer missed and b
 
 Produce a bundle of paired pull requests:
 
-- **shipped** — a bug reached the default branch, a later pull request fixed it, and the reviewer had that code in front of it and said nothing;
-- **caught** — the reviewer reported a real defect and the team repaired it.
+- **shipped** — a bug reached the default branch, a later pull request fixed it, and the reviewer had that code in front of it and did not report it;
+- **caught** — the reviewer reported a real defect and the team repaired or accepted it.
 
 Both halves matter. A set of only misses tells a vendor where it failed and nothing about what to protect; a set of only catches is a testimonial. Ship a mix.
 
@@ -22,11 +22,11 @@ The cost of mining this way is that it is not a measurement. Bugs nobody fixed a
 
 ## Portable contract
 
-This skill is self-contained. It requires authenticated `gh`, `git`, Node.js, and read access to the repository. It must not rely on vendor APIs or internal telemetry.
+Requires authenticated `gh`, `git`, and Node.js, plus read access to the repository. No vendor APIs, no internal telemetry.
 
 Use the directory containing this file as `<SKILL_DIR>` and a fresh directory as `<RUN_DIR>`. Do not assume the skill is installed under `.claude`, `.codex`, or any fixed path.
 
-Run every command from a **full clone** of the repository. `git blame` on a shallow clone attributes every line to the graft boundary and invents origin commits; the scripts refuse to run rather than produce that, and the fix is `git fetch --unshallow`.
+Run against a **full clone**. `git blame` on a shallow clone attributes every line to the graft boundary and invents origin commits; the scripts refuse to run rather than produce that, and the fix is `git fetch --unshallow`. Prefer an ordinary clone over `--filter=blob:none`, which makes blame fetch blobs one at a time and turns a ten-second trace into minutes.
 
 The run is read-only. It must not trigger reviews, edit pull requests, post comments, or change repository state.
 
@@ -36,7 +36,8 @@ The run is read-only. It must not trigger reviews, edit pull requests, post comm
 
 - The fix is the ground truth. A reviewer's silence is not evidence of anything on its own, and a reviewer's comment is not evidence that a bug existed.
 - A missed case requires the exact commit the reviewer read **and** evidence that the buggy lines already existed at that commit. A reviewer whose only run predates the bug missed nothing.
-- Establish presence by ancestry or by verbatim content. Neither firing is `unmeasured`, which drops the case. It is never "probably present".
+- Presence is established by ancestry or by verbatim content. Neither firing is unmeasured, which drops the case. It is never "probably present".
+- **`false` and `null` are different answers.** `false` means the reviewer read the code and the bug was not there. `null` means nothing is known. Collapsing the second into the first turns an absence of evidence into a finding of innocence, and it silently deletes the category this skill exists to be careful about.
 - Judge every claim at the reviewed commit. Current head is not a substitute.
 - A negative claim about a reviewer that no second reader challenged does not leave the building.
 - Store the structured case file before writing any prose. The Markdown is generated from the cases, never the other way round.
@@ -44,33 +45,45 @@ The run is read-only. It must not trigger reviews, edit pull requests, post comm
 
 ## 1. Declare the scope
 
-Fix three things before collecting, and record them:
+Fix three things before collecting, and record them.
 
-- **Window.** `--since` inclusive, `--until` exclusive, so adjacent windows never double-count. A calendar month or quarter is usually right. Leave enough time after the window for fixes to have landed: a bug that shipped last week has not been fixed yet, so a window ending yesterday finds almost nothing.
-- **Authors.** `--authors` restricts to specific pull request authors. Use it when the team's habits differ enough to bias the set — for example when one engineer routinely tells their coding agent to address the reviewer's comments and another does not. Say in the report which scope was used.
-- **Roster.** `--only` names the reviewer identities, comma separated, with or without the `[bot]` suffix. Discover them from the pull requests themselves rather than guessing a login.
+**Window.** `--since` inclusive, `--until` exclusive. A calendar month or quarter is usually right. Leave time after the window for fixes to have landed — a bug that shipped last week has not been fixed yet, so a window ending yesterday finds almost nothing. Both dates must be `YYYY-MM-DD` with zero padding; anything else is rejected rather than silently searched.
+
+**Authors.** `--authors` restricts to specific pull request authors. Use it when the team's habits differ enough to bias the set — for example when one engineer routinely tells their coding agent to address the reviewer's comments and another does not. It filters client-side after collection, so it narrows the corpus rather than widening the search. Say in the report which scope was used.
+
+**Roster.** Discover the reviewer identities from the repository rather than guessing a login:
+
+```bash
+gh pr list --repo <owner/repo> --state merged \
+  --search "merged:>=<since> merged:<<until>" --limit 200 --json number,reviews \
+  --jq '[.[].reviews[].author.login] | group_by(.) | map({login: .[0], reviews: length}) | sort_by(-.reviews)'
+
+gh api "repos/<owner/repo>/issues/comments?per_page=100&since=<since>T00:00:00Z" \
+  --paginate --jq '[.[] | select(.user.type == "Bot") | .user.login] | group_by(.) | map({login: .[0], comments: length})'
+```
+
+Run both. The second one matters: a reviewer that publishes its whole verdict as one top-level comment appears nowhere in the first. Note also that `gh pr list` returns logins **without** the `[bot]` suffix while the REST API returns them **with** it; `--only` accepts either spelling, and some app reviewers have no `[bot]` suffix at all.
 
 ## 2. Propose candidates
-
-Both modes, into the same run directory:
 
 ```bash
 node <SKILL_DIR>/scripts/find-candidates.mjs \
   --repo <owner/repo> --mode shipped \
-  --since 2026-08-01 --until 2026-09-01 \
-  [--authors alice,bob] --limit 300 \
+  --since 2026-06-01 --until 2026-08-01 [--authors alice,bob] \
   --out <RUN_DIR>/candidates-shipped.json
 
 node <SKILL_DIR>/scripts/find-candidates.mjs \
   --repo <owner/repo> --mode caught \
-  --since 2026-08-01 --until 2026-09-01 \
-  [--authors alice,bob] --only "<reviewer>[bot]" --limit 300 \
+  --since 2026-06-01 --until 2026-08-01 [--authors alice,bob] \
+  --only "<reviewer-a>,<reviewer-b>" \
   --out <RUN_DIR>/candidates-caught.json
 ```
 
-`shipped` mode scores merged pull requests for fix signals: a revert, a bug label, a closed issue, fix language in the title, symptom language, a root cause in the body. `caught` mode lists merged pull requests carrying a published review from the roster.
+`shipped` scores merged pull requests for fix signals: a revert, a bug label, a closed issue, fix language in the title, symptom language, a root cause in the body. `caught` finds pull requests where a roster reviewer published, on **either** surface — a review body or a top-level comment. Searching only for review bodies misses a summary-only reviewer entirely, which on one repository under test was a quarter of the merged population.
 
-These are leads. Most will not become cases, and that is the normal outcome, not a collection failure. Check `population.limitReached` before describing the run as complete.
+`gh` returns newest-first and stops at `--limit`, so a busy repository would answer a two-month question with its last two days. The collector splits the window and asks again until each sub-window fits, so you get the window you asked for. Check `population.complete` before describing the run as complete; if it is `false`, `population.subWindowsTruncated` names the days that overflowed and `--limit` needs raising.
+
+These are leads. Most will not become cases, and that is the normal outcome, not a collection failure.
 
 ## 3. Trace each shipped candidate back to its origin
 
@@ -79,61 +92,93 @@ Work down the ranked list. Highest fix signal and smallest diff first: a two-fil
 ```bash
 node <SKILL_DIR>/scripts/trace-origin.mjs \
   --repo <owner/repo> --pr <fix-pr> \
-  --only "<reviewer>[bot]" --repo-path <full-clone> \
+  --only "<reviewer-a>,<reviewer-b>" --repo-path <full-clone> \
   --out <RUN_DIR>/origins/<fix-pr>.json
 ```
 
 It blames the lines the fix rewrote against the tree the fix landed on, ranks the commits that wrote them, finds the pull request that shipped each one, and for every reviewer reports the exact commits it read and whether the buggy lines existed at each.
 
-Read `origins[].originPrs[].reviewers[].hadOpportunity`:
+Four things it deliberately refuses to trace, because each one manufactured false cases in testing:
 
-- `true` — the reviewer had this code in front of it. This is a case.
-- `false` — it ran before the lines existed, or it never published here. Not a case. Do not turn it into one.
-- `null` — presence could not be established. Not a case. Record it as unmeasured.
+- **Non-product files.** A fix almost always touches its own tests. Blaming those attributes the bug to whoever last edited a fixture, and eligibility ends up decided by a mock branch or a docstring. Tests, fixtures, docs, generated and vendored trees are skipped; you will see them as `non-product-path` in `files[]`.
+- **Insertion anchors.** A hunk that only adds lines has no pre-image, so it cannot say what was wrong. Add-only fixes therefore produce **no origin at all** — which is correct, because a bug of omission has no origin commit. Do not go looking for one.
+- **History artefacts.** Subtree imports, merge commits and bulk reformats own thousands of lines and have no reviewable pull request. They are excluded from ranking and listed in `historyArtefactsExcluded`.
+- **Unidentifiable needles.** The content test needs a block of real code. A comment, an import, or a lone punctuation line matches boilerplate anywhere in a large file, so a block with less than 40 characters of substantive code is rejected and listed in `origins[].rejectedBlocks`.
 
-The content test is deliberately strict: it looks for the buggy lines verbatim. A line that was later reformatted reads as absent even though the mechanism was present. That loses real cases and never invents one, which is the right direction to be wrong in.
+Read `origins[].originPrs[].reviewers[]`:
+
+| `hadOpportunity` | `reason` | What it means |
+| --- | --- | --- |
+| `true` | — | The reviewer had this code in front of it. This can become a case. |
+| `false` | `buggy-lines-absent-at-every-reviewed-commit` | It ran before the lines existed. Not a case. |
+| `false` | `no-published-output-on-this-pr` | It never published here. Not a case. |
+| `null` | `published-only-on-an-unpinned-surface` | It published, but with no commit pin, so nothing is known about what it saw. Not a case. |
+| `null` | `origin-share-below-threshold` | This origin owns too little of the blamed lines to assert anything. Not a case. |
+| `null` | `presence-could-not-be-established` | The commit or path could not be reached. Not a case. |
+
+Only `true` proceeds. Do not argue around a `false` or promote a `null`.
+
+Then check `presenceMethodCounts`. On a squash-merge repository `ancestry` will be `0` and every verdict rests on the approximate content test — the script warns when this happens. The content test looks for the buggy lines **verbatim**, so a line that was later reformatted reads as absent. That loses real cases and never invents one, which is the right direction to be wrong in.
 
 ## 4. Collect the caught candidates
 
 ```bash
 node <SKILL_DIR>/scripts/collect-reviews.mjs \
-  --repo <owner/repo> --pr <pr> --only "<reviewer>[bot]" \
+  --repo <owner/repo> --pr <pr> --only "<reviewer-a>,<reviewer-b>" \
   --out <RUN_DIR>/reviews/<pr>.json
 ```
 
-This adds what the shipped side gets from the fix commit: commits pushed after each finding, whether one of them touched the same file, and what humans said in reply. None of that proves the finding was a defect — teams fix nits and ignore real bugs — so it feeds adjudication rather than deciding it.
+This adds what the shipped side gets from the fix commit: commits pushed after each finding, whether one of them touched the same file, and what humans said in reply. None of that proves the finding was a defect — teams fix nits and ignore real bugs — so it feeds adjudication rather than deciding it. On a long-lived branch where every commit touches the same large file, `followedByCommitTouchingSamePath` carries no information at all; read the commit instead.
 
-## 5. Adjudicate
+Choose which candidates to collect. On a busy repository nearly every pull request carries a review, so ranking by review count sorts nothing. Prefer pull requests where the roster disagrees — one reviewer published and another did not — and pull requests whose findings drew a human reply.
 
-Give each candidate to a worker using the exact prompt in [references/agent-prompt.md](references/agent-prompt.md). Do not paraphrase it per candidate; labels from divergent prompts do not belong in one bundle.
+## 5. Generate a stub, then adjudicate
 
-The worker reads the code at the reviewed commit, decides whether a qualifying defect was there, decides whether the reviewer's published output named that mechanism, and writes one case file to `<RUN_DIR>/cases/<caseId>.json` in the shape defined by [references/case-schema.md](references/case-schema.md).
+Do not hand-write case files. Everything mechanical is already known:
+
+```bash
+node <SKILL_DIR>/scripts/emit-case-stub.mjs \
+  --trace <RUN_DIR>/origins/<fix-pr>.json --origin <sha|index> --reviewer "<login>" \
+  --out <RUN_DIR>/cases/<caseId>.json
+
+node <SKILL_DIR>/scripts/emit-case-stub.mjs \
+  --reviews <RUN_DIR>/reviews/<pr>.json --finding <finding-id> \
+  --out <RUN_DIR>/cases/<caseId>.json
+```
+
+The stub carries the repository, reviewer, origin commit and pull request, the exact reviewed commit, how presence was established, **what the reviewer actually published at that commit**, and the fix and its paths. What is left is judgement, emitted as `TODO:` strings that fail validation until they are replaced. It refuses to stub a reviewer whose `hadOpportunity` is not `true`.
+
+Then give each stub to a worker with the exact prompt in [references/agent-prompt.md](references/agent-prompt.md). Do not paraphrase it per candidate; labels from divergent prompts do not belong in one bundle. The schema is in [references/case-schema.md](references/case-schema.md).
 
 ## 6. Run the skeptic
 
-Give every case to a fresh worker with the skeptic prompt at the bottom of [references/agent-prompt.md](references/agent-prompt.md). It inspects the code itself and tries to overturn the verdict. Record `upheld`, `revised`, or `rejected` on the case. An unrun or rejected skeptic pass blocks export, and the bundler enforces that.
+Give every case to a fresh worker with the skeptic prompt at the bottom of [references/agent-prompt.md](references/agent-prompt.md). It inspects the code itself and tries to overturn the verdict. Record `upheld`, `revised`, or `rejected`, **with a note saying what was actually checked**. An unrun skeptic, a rejected one, or an upheld one with an empty note all block export.
 
 ## 7. Build the bundle
 
 ```bash
 node <SKILL_DIR>/scripts/build-bundle.mjs \
   --cases <RUN_DIR>/cases --out <RUN_DIR>/bundle \
-  --repo <owner/repo> --max-per-label 25 [--include-source]
+  --repo <owner/repo> --repo-path <full-clone> --only "<reviewer-a>,<reviewer-b>" \
+  --max-per-label 25 [--label-set "missed,caught"] [--include-source]
 ```
 
-Without `--include-source` the bundle carries links, SHAs, paths, line numbers, prose, and the reviewer's own published output — no source. With it, the bundle also carries the patches for the files each case names, from the origin pull request and the fix pull request only. Ask the repository owner which one they want.
+Shape validation is not enough — a case file is written by a language model and every field in it is a claim — so the bundler also reads the repository. It checks that the reviewed commit is reachable, that `origin.path` exists at `origin.sha`, that the fix pull request exists and merged, that the reviewer is on the roster, and that origin and fix are not the same pull request unless the case says so. `--skip-truth-checks` exists for an offline run and stamps the manifest as unverified; do not send an unverified bundle.
 
-The bundler rejects a case that cannot support its claim and lists every rejection with its reason. Read that list: a high rejection count usually means the adjudication prompt drifted, not that the repository is clean.
+Without `--include-source` the bundle carries links, SHAs, paths, line numbers, prose, and excerpts of the reviewer's own published output. With it, the bundle also carries the patches for the files each case names, from the origin pull request and the fix pull request only. A case whose named paths cannot be found in its pull request is **dropped**, not exported with the whole pull request attached — that fallback once put 487 files of a customer's source into a bundle built from a case that named one.
+
+Read the rejection list. A high count usually means the adjudication prompt drifted, not that the repository is clean.
 
 ## 8. Hand it over
 
-The bundle is `manifest.json`, `cases.json`, and `CASES.md`. Send all three; the Markdown is for reading and the JSON is what a vendor can actually build against.
+The bundle is `manifest.json`, `cases.json`, and `CASES.md`. Send all three; the Markdown is for reading and the JSON is what a vendor can build against.
 
 Say plainly, every time:
 
 - how the set was mined, and that it is therefore a lower bound rather than a measurement;
-- the window, the author scope, and the reviewer roster;
+- the window, whether it was collected completely, the author scope, and the reviewer roster;
 - how many candidates were examined to produce this many cases;
 - how many cases were rejected and why;
-- that presence at the reviewed commit was established by ancestry or verbatim content, and that the content test loses real cases; and
-- that no recall, precision, or ranking claim can be drawn from this bundle.
+- whether `ancestry` fired at all, or whether every verdict rests on the verbatim-content test;
+- that add-only fixes and bugs of omission cannot appear in this bundle at all; and
+- that no recall, precision, or ranking claim can be drawn from it.

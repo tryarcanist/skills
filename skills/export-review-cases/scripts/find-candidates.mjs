@@ -23,9 +23,10 @@
 //   find-candidates.mjs --self-test
 
 import { writeFileSync } from "node:fs";
-import { ghPrList, makeRoster, parseArgs, warn, warnings } from "./lib/gh.mjs";
+import { ghPrList, makeRoster, parseArgs, validateWindow, warn, warnings } from "./lib/gh.mjs";
 
-const DEFAULT_LIMIT = 300;
+const DEFAULT_LIMIT = 1000;
+const MIN_SPLIT_DAYS = 1;
 
 // Signals that a merged PR repaired a defect. Weighted, because a title word is
 // weak evidence on its own and a linked bug issue is strong.
@@ -95,6 +96,9 @@ if (!["shipped", "caught"].includes(args.mode)) usage("--mode must be shipped or
 if (!args.since || !args.until) usage("--since and --until are required");
 if (!args.out) usage("--out is required");
 
+const windowProblems = validateWindow(args.since, args.until);
+if (windowProblems.length) usage(windowProblems.join("; "));
+
 const limit = Number(args.limit || DEFAULT_LIMIT);
 const roster = makeRoster(args.only);
 if (args.mode === "caught" && roster.isEmpty) usage("--only is required in caught mode");
@@ -103,24 +107,94 @@ const authorFilter = String(args.authors || "")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 
 // `--until` is exclusive so that adjacent windows never double-count a PR.
-const search = `merged:>=${args.since} merged:<${args.until}`;
+//
+// `gh pr list` returns newest first and stops at --limit, so a busy repository
+// silently answers a two-month question with its last two days. Rather than
+// warn about that and move on, split the window and ask again: the operator
+// gets the window they asked for, or an explicit statement of which sub-window
+// could not be exhausted.
 const fields = ["number", "title", "body", "url", "author", "labels", "mergedAt", "mergeCommit", "changedFiles", "additions", "deletions", "baseRefName"];
 if (args.mode === "caught") fields.push("reviews");
 
-const prs = ghPrList([
-  "--repo", args.repo, "--state", "merged", "--search", search,
-  "--limit", String(limit), "--json", fields.join(","),
-]);
+const dayjs = (iso) => Date.parse(`${iso}T00:00:00Z`);
+const isoDay = (ms) => new Date(ms).toISOString().slice(0, 10);
+const spanDays = (from, to) => Math.round((dayjs(to) - dayjs(from)) / 86400000);
 
-if (prs.length >= limit) {
-  warn(`--limit ${limit} was reached; the window is truncated and this is a convenience sample, not the full population`);
+const exhausted = [];
+const unexhausted = [];
+let searchCalls = 0;
+
+function listWindow(from, toExclusive, extraQualifiers = "") {
+  searchCalls += 1;
+  const search = `merged:>=${from} merged:<${toExclusive}${extraQualifiers ? ` ${extraQualifiers}` : ""}`;
+  return ghPrList([
+    "--repo", args.repo, "--state", "merged", "--search", search,
+    "--limit", String(limit), "--json", fields.join(","),
+  ]);
 }
+
+function collectWindow(from, toExclusive, extraQualifiers = "") {
+  const page = listWindow(from, toExclusive, extraQualifiers);
+  if (page.length < limit) {
+    exhausted.push({ from, toExclusive, returned: page.length });
+    return page;
+  }
+  const days = spanDays(from, toExclusive);
+  if (days <= MIN_SPLIT_DAYS) {
+    unexhausted.push({ from, toExclusive, returned: page.length });
+    warn(
+      `${from}..${toExclusive} returned ${page.length} PRs at --limit ${limit} and cannot be split further; ` +
+        `this sub-window is truncated to its most recent PRs. Raise --limit to cover it.`,
+    );
+    return page;
+  }
+  const mid = isoDay(dayjs(from) + Math.floor((dayjs(toExclusive) - dayjs(from)) / 2 / 86400000) * 86400000);
+  const split = mid === from ? isoDay(dayjs(from) + 86400000) : mid;
+  return [...collectWindow(from, split, extraQualifiers), ...collectWindow(split, toExclusive, extraQualifiers)];
+}
+
+const byNumber = new Map();
+const commentedBy = new Map(); // pr number -> roster spellings that commented on it
+const absorb = (list) => {
+  for (const pr of list) if (!byNumber.has(pr.number)) byNumber.set(pr.number, pr);
+};
+
+absorb(collectWindow(args.since, args.until));
+
+// `gh pr list --json reviews` carries review bodies only. A reviewer that
+// publishes its whole verdict as a single top-level comment has no review at
+// all, so a reviews-only sweep is structurally blind to it -- on one repository
+// under test that was a quarter of the merged population. The commenter search
+// qualifier finds those PRs; the union is what caught mode actually needs.
+if (args.mode === "caught") {
+  for (const spelling of roster.spellings) {
+    const before = byNumber.size;
+    const found = collectWindow(args.since, args.until, `commenter:${spelling}`);
+    absorb(found);
+    for (const pr of found) {
+      if (!commentedBy.has(pr.number)) commentedBy.set(pr.number, []);
+      commentedBy.get(pr.number).push(spelling);
+    }
+    const added = byNumber.size - before;
+    process.stderr.write(
+      `commenter:${spelling}: ${found.length} PR(s), ${added} of them with no published review body at all\n`,
+    );
+  }
+}
+
+const prs = [...byNumber.values()];
 
 const authorLogin = (pr) => String(pr.author?.login || "").toLowerCase();
 const inAuthorScope = (pr) => authorFilter.length === 0 || authorFilter.includes(authorLogin(pr));
 
 const scoped = prs.filter(inAuthorScope);
 const droppedByAuthor = prs.length - scoped.length;
+if (authorFilter.length && scoped.length === 0 && prs.length > 0) {
+  warn(
+    `--authors ${authorFilter.join(",")} matched none of the ${prs.length} merged PR(s) in this window; ` +
+      `check the login spelling before reading this as "this author shipped no fixes"`,
+  );
+}
 
 let candidates;
 if (args.mode === "shipped") {
@@ -144,19 +218,31 @@ if (args.mode === "shipped") {
       const reviews = (pr.reviews || []).filter(
         (r) => roster.has(r.author?.login) && String(r.body || "").trim().length > 0,
       );
-      return { pr, reviews };
+      return { pr, reviews, commenters: commentedBy.get(pr.number) || [] };
     })
-    .filter((c) => c.reviews.length > 0)
-    .map(({ pr, reviews }) => ({
-      pr: pr.number, url: pr.url, title: pr.title, author: authorLogin(pr),
-      mergedAt: pr.mergedAt, mergeCommit: pr.mergeCommit?.oid || null,
-      baseRef: pr.baseRefName, changedFiles: pr.changedFiles,
-      additions: pr.additions, deletions: pr.deletions,
-      labels: (pr.labels || []).map((l) => l.name),
-      reviewers: [...new Set(reviews.map((r) => r.author.login))],
-      reviewBodies: reviews.length,
-    }))
-    .sort((a, b) => b.reviewBodies - a.reviewBodies || a.changedFiles - b.changedFiles);
+    // A PR qualifies on either surface. Requiring a review body here is what
+    // made a summary-only reviewer invisible to this mode.
+    .filter((c) => c.reviews.length > 0 || c.commenters.length > 0)
+    .map(({ pr, reviews, commenters }) => {
+      const fromReviews = reviews.map((r) => roster.spell(r.author.login));
+      const fromComments = commenters.map((c) => roster.spell(c));
+      return {
+        pr: pr.number, url: pr.url, title: pr.title, author: authorLogin(pr),
+        mergedAt: pr.mergedAt, mergeCommit: pr.mergeCommit?.oid || null,
+        baseRef: pr.baseRefName, changedFiles: pr.changedFiles,
+        additions: pr.additions, deletions: pr.deletions,
+        labels: (pr.labels || []).map((l) => l.name),
+        reviewers: [...new Set([...fromReviews, ...fromComments])],
+        reviewBodies: reviews.length,
+        // Surfaces matter downstream: a reviewer seen only here published
+        // without a commit pin, so its findings cannot be placed on a commit.
+        surfaces: {
+          reviewBody: [...new Set(fromReviews)],
+          topLevelCommentOnly: fromComments.filter((c) => !fromReviews.includes(c)),
+        },
+      };
+    })
+    .sort((a, b) => b.reviewers.length - a.reviewers.length || b.reviewBodies - a.reviewBodies || a.changedFiles - b.changedFiles);
 }
 
 const out = {
@@ -170,7 +256,10 @@ const out = {
     mergedPrsScanned: prs.length,
     droppedByAuthorScope: droppedByAuthor,
     limit,
-    limitReached: prs.length >= limit,
+    searchCalls,
+    subWindowsExhausted: exhausted.length,
+    subWindowsTruncated: unexhausted,
+    complete: unexhausted.length === 0,
   },
   candidateCount: candidates.length,
   candidates,

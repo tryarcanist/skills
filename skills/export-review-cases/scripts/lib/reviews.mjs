@@ -9,12 +9,21 @@
 
 import { ghJson } from "./gh.mjs";
 
-export const MAX_BODY_CHARS = 20000;
+// Some reviewers publish one very long walkthrough comment rather than inline
+// comments, and the skeptic pass is explicitly asked whether the reviewer named
+// a mechanism "inside a long summary body". A cap that clips those bodies makes
+// that question unanswerable from the artefact, so the cap sits far above the
+// largest bodies observed in testing rather than just above the typical one.
+export const MAX_BODY_CHARS = 200000;
 
 function clip(body) {
   const text = String(body || "");
-  if (text.length <= MAX_BODY_CHARS) return { text, truncated: false };
-  return { text: `${text.slice(0, MAX_BODY_CHARS)}\n\n[truncated at ${MAX_BODY_CHARS} characters]`, truncated: true };
+  if (text.length <= MAX_BODY_CHARS) return { text, truncated: false, length: text.length };
+  return {
+    text: `${text.slice(0, MAX_BODY_CHARS)}\n\n[truncated at ${MAX_BODY_CHARS} of ${text.length} characters -- refetch this comment before concluding the reviewer did not name a mechanism]`,
+    truncated: true,
+    length: text.length,
+  };
 }
 
 // Every published surface a reviewer may use: review bodies, inline review
@@ -26,7 +35,7 @@ export function fetchReviewerOutput(repo, pr, roster) {
   const reviews = ghJson(`${base}/reviews?per_page=100`, { tolerate: true })
     .filter((r) => roster.has(r.user?.login))
     .map((r) => {
-      const { text, truncated } = clip(r.body);
+      const { text, truncated, length } = clip(r.body);
       return {
         kind: "review",
         id: `review-${r.id}`,
@@ -37,13 +46,14 @@ export function fetchReviewerOutput(repo, pr, roster) {
         url: r.html_url,
         body: text,
         bodyTruncated: truncated,
+        bodyLength: length,
       };
     });
 
   const inline = ghJson(`${base}/comments?per_page=100`, { tolerate: true })
     .filter((c) => roster.has(c.user?.login))
     .map((c) => {
-      const { text, truncated } = clip(c.body);
+      const { text, truncated, length } = clip(c.body);
       return {
         kind: "inline",
         id: `inline-${c.id}`,
@@ -56,13 +66,14 @@ export function fetchReviewerOutput(repo, pr, roster) {
         url: c.html_url,
         body: text,
         bodyTruncated: truncated,
+        bodyLength: length,
       };
     });
 
   const issue = ghJson(`repos/${repo}/issues/${pr}/comments?per_page=100`, { tolerate: true })
     .filter((c) => roster.has(c.user?.login))
     .map((c) => {
-      const { text, truncated } = clip(c.body);
+      const { text, truncated, length } = clip(c.body);
       return {
         kind: "summary",
         id: `comment-${c.id}`,
@@ -72,6 +83,7 @@ export function fetchReviewerOutput(repo, pr, roster) {
         url: c.html_url,
         body: text,
         bodyTruncated: truncated,
+        bodyLength: length,
       };
     });
 

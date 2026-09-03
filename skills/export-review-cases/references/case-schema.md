@@ -1,6 +1,10 @@
 # Case file schema
 
-One JSON file per case, written to `<RUN_DIR>/cases/<caseId>.json`. `build-bundle.mjs` validates every file and refuses the ones that cannot support their own claim.
+One JSON file per case, written to `<RUN_DIR>/cases/<caseId>.json`.
+
+**Do not write one by hand.** `emit-case-stub.mjs` fills every mechanical field from the trace or reviews file and leaves the judgement fields as `TODO:` strings. Replace those; keep the rest.
+
+`build-bundle.mjs` validates every file for shape, then re-checks the factual fields against git and GitHub, and refuses the ones that cannot support their own claim.
 
 ```json
 {
@@ -9,6 +13,8 @@ One JSON file per case, written to `<RUN_DIR>/cases/<caseId>.json`. `build-bundl
   "repo": "owner/repo",
   "reviewer": "reviewer[bot]",
   "verdict": "missed",
+  "resolution": "fixed",
+  "resolutionEvidence": null,
   "confidence": "high",
 
   "bug": {
@@ -40,7 +46,19 @@ One JSON file per case, written to `<RUN_DIR>/cases/<caseId>.json`. `build-bundl
   "reviewerOutputAtThatCommit": {
     "published": true,
     "namedTheMechanism": false,
-    "quotes": []
+    "quotes": [],
+    "publishedItems": [
+      {
+        "id": "inline-3894866990",
+        "kind": "inline",
+        "url": "https://github.com/owner/repo/pull/12904#discussion_r3894866990",
+        "path": "src/app/persistence.py",
+        "line": 88,
+        "reviewedCommit": "e41d7559...",
+        "excerpt": "First 600 characters of what the reviewer actually said here.",
+        "bodyTruncated": false
+      }
+    ]
   },
 
   "fix": {
@@ -53,11 +71,18 @@ One JSON file per case, written to `<RUN_DIR>/cases/<caseId>.json`. `build-bundl
   },
 
   "whatWouldHaveCaughtIt": "The concrete act: running the endpoint, reading the other caller, diffing the two code paths.",
-  "skeptic": { "ran": true, "verdict": "upheld", "note": "What the skeptic checked and found." }
+  "skeptic": { "ran": true, "verdict": "upheld", "note": "What the skeptic checked and found." },
+  "provenance": { "trace": "<RUN_DIR>/origins/13283.json", "buggyBlock": {}, "rejectedBlocks": [], "presenceReason": null }
 }
 ```
 
 ## Field notes
+
+**`resolution`** is `fixed`, `acknowledged`, `deferred`, or `none`, and it decides whether `fix.pr` is required. A **missed** case must be `fixed` — the merged fix is the only proof the bug was real, so there is no such thing as an unfixed missed case in this bundle. A **caught** case may be `acknowledged` or `deferred`: a reviewer finding that the author agreed with and filed a ticket for is a real catch even though nothing merged. Anything other than `fixed` needs `resolutionEvidence` naming who agreed and where. Do not point `fix.pr` at the pull request the finding was published on to satisfy the field; that corrupts what `fix` means across the whole bundle. Use `fixedInSamePr: true` when the finding was genuinely repaired before merge.
+
+**`reviewerOutputAtThatCommit.publishedItems`** is what the reviewer actually said at that commit. A missed case has no `quotes` by definition, so without this the bundle carries no evidence of what the reviewer was doing instead — and "it commented three times on this file about something else" is the single most useful sentence you can hand a vendor. `emit-case-stub.mjs` fills it. If `bodyTruncated` is true on any item, refetch that comment before concluding the reviewer did not name the mechanism.
+
+**`provenance`** carries the machine evidence the verdict rests on, including the `buggyBlock` used as the presence needle and any `rejectedBlocks`. Look at the block before trusting the verdict: if the needle is not code you would call the bug, the origin is probably wrong even when the tooling said `true`.
 
 **`verdict`** is `missed` or `caught` to publish. Use `not_eligible` when the reviewer never had the code, and `not_a_bug` when the fix repaired something that was not a defect. Both are recorded and neither is exported — writing them down is what keeps the rejection count honest.
 
