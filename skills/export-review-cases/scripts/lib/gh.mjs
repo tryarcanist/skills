@@ -1,0 +1,142 @@
+// Shared GitHub access for export-review-cases.
+//
+// Every script in this skill talks to GitHub through here so that retries,
+// pagination, and degraded-data reporting behave identically. A tolerated
+// failure is recorded as a warning and returns an empty result; it never
+// returns a silent zero that a later count would read as "observed none".
+
+import { execFileSync } from "node:child_process";
+
+export const GH_ATTEMPTS = 3;
+const RETRY_DELAYS_MS = [2000, 4000, 8000];
+const SECONDARY_RATE_LIMIT_DELAY_MS = 60000;
+const MAX_BUFFER = 128 * 1024 * 1024;
+
+export const warnings = [];
+
+export function warn(msg) {
+  warnings.push(msg);
+  process.stderr.write(`warn: ${msg}\n`);
+}
+
+export function sleepSync(ms) {
+  if (!(ms > 0)) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+export function runGh(ghArgs) {
+  let detail = "";
+  for (let attempt = 0; attempt < GH_ATTEMPTS; attempt += 1) {
+    try {
+      return execFileSync("gh", ghArgs, { encoding: "utf8", maxBuffer: MAX_BUFFER });
+    } catch (e) {
+      detail = (e.stderr || e.message || "").toString().trim().slice(0, 300);
+      if (attempt === GH_ATTEMPTS - 1) break;
+      const secondary =
+        /secondary rate limit|abuse detection|was submitted too quickly|rate limit exceeded|retry-after/i.test(
+          detail,
+        );
+      const delay = secondary
+        ? Math.max(SECONDARY_RATE_LIMIT_DELAY_MS, RETRY_DELAYS_MS[attempt])
+        : RETRY_DELAYS_MS[attempt];
+      process.stderr.write(
+        `gh failed (attempt ${attempt + 1}/${GH_ATTEMPTS}${secondary ? ", secondary rate limit" : ""}), ` +
+          `retrying in ${Math.round(delay / 1000)}s: ${detail}\n`,
+      );
+      sleepSync(delay);
+    }
+  }
+  const err = new Error(detail || "gh failed");
+  err.detail = detail;
+  throw err;
+}
+
+function parseOrWarn(raw, label) {
+  const text = (raw || "").trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    warn(`could not parse gh output for ${label}; treated as empty`);
+    return null;
+  }
+}
+
+// Paginated list endpoint. --slurp returns one array per page, so flatten.
+// No text rewriting, so bracket sequences inside comment bodies survive.
+export function ghJson(path, { tolerate = false } = {}) {
+  let raw;
+  try {
+    raw = runGh(["api", path, "--paginate", "--slurp"]);
+  } catch (e) {
+    const detail = e.detail || e.message || "";
+    if (tolerate) {
+      warn(`GET ${path} failed after ${GH_ATTEMPTS} attempt(s) and was treated as empty: ${detail}`);
+      return [];
+    }
+    process.stderr.write(`gh api ${path} failed: ${detail}\n`);
+    process.exit(1);
+  }
+  const pages = parseOrWarn(raw, path);
+  if (pages === null) return [];
+  return Array.isArray(pages) ? pages.flat() : [];
+}
+
+// Single-object endpoint. Returns null on a tolerated failure, which callers
+// must distinguish from an object with empty fields.
+export function ghOne(path, { tolerate = false } = {}) {
+  let raw;
+  try {
+    raw = runGh(["api", path]);
+  } catch (e) {
+    const detail = e.detail || e.message || "";
+    if (tolerate) {
+      warn(`GET ${path} failed after ${GH_ATTEMPTS} attempt(s) and was treated as missing: ${detail}`);
+      return null;
+    }
+    process.stderr.write(`gh api ${path} failed: ${detail}\n`);
+    process.exit(1);
+  }
+  return parseOrWarn(raw, path);
+}
+
+// `gh pr list --json` is not the REST API and is not paginated the same way;
+// it returns one JSON array capped by --limit.
+export function ghPrList(ghArgs) {
+  const raw = runGh(["pr", "list", ...ghArgs]);
+  const parsed = parseOrWarn(raw, `gh pr list ${ghArgs.join(" ")}`);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+export function parseArgs(argv, spec) {
+  const out = {};
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (!a.startsWith("--")) return { error: `unexpected argument ${a}` };
+    const key = a.slice(2).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+    if (!(key in spec)) return { error: `unknown flag ${a}` };
+    if (spec[key] === "flag") out[key] = true;
+    else out[key] = argv[(i += 1)];
+  }
+  return out;
+}
+
+// A reviewer roster entry may be written with or without the [bot] suffix.
+// Normalising both sides here keeps one spelling from silently scoring zero.
+export function normalizeLogin(login) {
+  return String(login || "")
+    .toLowerCase()
+    .replace(/\[bot\]$/, "");
+}
+
+export function makeRoster(only) {
+  const logins = String(only || "")
+    .split(",")
+    .map((s) => normalizeLogin(s.trim()))
+    .filter(Boolean);
+  return {
+    logins,
+    has: (login) => logins.includes(normalizeLogin(login)),
+    isEmpty: logins.length === 0,
+  };
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Export Review Cases"
+  short_description: "Bugs a reviewer missed, paired with their fixes"
+  default_prompt: "Use $export-review-cases to build a case set of bugs the AI code reviewer on this repository missed and bugs it caught, each paired with the merged pull request that fixed it."

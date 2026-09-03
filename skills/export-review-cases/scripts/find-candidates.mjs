@@ -1,0 +1,184 @@
+#!/usr/bin/env node
+// Propose pull requests worth turning into review cases. Two modes, mined from
+// opposite ends, because the two case types have different ground truth.
+//
+//   --mode shipped   Merged fix PRs. A merged fix is proof that a bug was real
+//                    and that the team cared enough to repair it. Mining from
+//                    fixes rather than from reviewer output is the point: it
+//                    can surface a bug no reviewer ever mentioned, which is
+//                    exactly the case a reviewer-first search cannot see.
+//
+//   --mode caught    Merged PRs carrying a published review from the roster.
+//                    These become the counterweight cases, but only after
+//                    adjudication confirms the finding was a real defect.
+//
+// This script proposes. It never labels. Every candidate here is a lead for
+// trace-origin.mjs and a human-or-agent adjudication pass, and a candidate that
+// survives neither is a normal outcome, not a collection failure.
+//
+// Usage:
+//   find-candidates.mjs --repo owner/repo --mode shipped|caught \
+//     --since 2026-08-01 --until 2026-09-01 [--authors a,b] \
+//     [--only "arcanist[bot],cursor[bot]"] [--limit 300] --out file
+//   find-candidates.mjs --self-test
+
+import { writeFileSync } from "node:fs";
+import { ghPrList, makeRoster, parseArgs, warn, warnings } from "./lib/gh.mjs";
+
+const DEFAULT_LIMIT = 300;
+
+// Signals that a merged PR repaired a defect. Weighted, because a title word is
+// weak evidence on its own and a linked bug issue is strong.
+const FIX_SIGNALS = [
+  { name: "revert", weight: 4, test: (t) => /^revert\b|\brevert(s|ed|ing)?\b/i.test(t.title) },
+  { name: "bug-label", weight: 4, test: (t) => t.labelText.some((l) => /bug|regression|incident|sev[0-9]|hotfix|outage/i.test(l)) },
+  { name: "closes-issue", weight: 3, test: (t) => /\b(fix(es|ed)?|close[sd]?|resolve[sd]?)\s+#\d+/i.test(t.body) },
+  { name: "title-fix", weight: 3, test: (t) => /\b(fix|fixes|fixed|bug|bugfix|hotfix|regression|revert|repair)\b/i.test(t.title) },
+  { name: "title-symptom", weight: 2, test: (t) => /\b(crash|broken|breaks|incorrect|wrong|missing|leak|hang|stale|duplicate|race|deadlock|timeout|null|undefined|off-by-one|500|not working)\b/i.test(t.title) },
+  { name: "body-symptom", weight: 1, test: (t) => /\b(root cause|regression|reproduce[sd]?|repro\b|stack trace|traceback|incident|postmortem)\b/i.test(t.body) },
+];
+
+// A merged PR whose title reads like routine upkeep is dropped before scoring.
+// These produce traceable blame ranges and no bug, which wastes the expensive
+// adjudication pass.
+const UPKEEP_TITLE = /^(chore|docs?|style|refactor|test|ci|build|deps?|dependabot|bump|release|version|merge branch|revert "revert)\b/i;
+
+function scoreFixSignals(pr) {
+  const target = {
+    title: pr.title || "",
+    body: pr.body || "",
+    labelText: (pr.labels || []).map((l) => l.name || ""),
+  };
+  const signals = FIX_SIGNALS.filter((s) => s.test(target));
+  return { signals: signals.map((s) => s.name), score: signals.reduce((n, s) => n + s.weight, 0) };
+}
+
+function usage(msg) {
+  if (msg) process.stderr.write(`error: ${msg}\n`);
+  process.stderr.write(
+    "usage: find-candidates.mjs --repo owner/repo --mode shipped|caught --since DATE --until DATE\n" +
+      "                          [--authors a,b] [--only \"bot-a,bot-b\"] [--limit N] --out file\n" +
+      "       find-candidates.mjs --self-test\n",
+  );
+  process.exit(2);
+}
+
+function selfTest() {
+  const cases = [];
+  const eq = (name, actual, expected) =>
+    cases.push({ name, ok: JSON.stringify(actual) === JSON.stringify(expected), actual, expected });
+
+  eq("a linked bug issue outscores a bare title word",
+    scoreFixSignals({ title: "Fix retry", body: "Fixes #42", labels: [] }).score > 
+      scoreFixSignals({ title: "Fix retry", body: "", labels: [] }).score, true);
+  eq("a bug label is detected", scoreFixSignals({ title: "Adjust cap", body: "", labels: [{ name: "bug" }] }).signals, ["bug-label"]);
+  eq("a revert is detected", scoreFixSignals({ title: 'Revert "Add cache"', body: "", labels: [] }).signals.includes("revert"), true);
+  eq("a clean feature PR scores zero", scoreFixSignals({ title: "Add export button", body: "", labels: [] }).score, 0);
+  eq("upkeep titles are recognised", ["chore: bump deps", "docs: readme", "Refactor client"].map((t) => UPKEEP_TITLE.test(t)), [true, true, true]);
+  eq("a real fix title is not upkeep", UPKEEP_TITLE.test("Fix stale cache key after fallback"), false);
+  eq("symptom words alone still qualify", scoreFixSignals({ title: "Stop the duplicate webhook", body: "", labels: [] }).score > 0, true);
+
+  for (const c of cases) process.stdout.write(`${c.ok ? "ok  " : "FAIL"} ${c.name}\n`);
+  const failed = cases.filter((c) => !c.ok);
+  for (const c of failed) process.stdout.write(`     actual=${JSON.stringify(c.actual)} expected=${JSON.stringify(c.expected)}\n`);
+  process.exit(failed.length ? 1 : 0);
+}
+
+const args = parseArgs(process.argv.slice(2), {
+  repo: "value", mode: "value", since: "value", until: "value",
+  authors: "value", only: "value", limit: "value", out: "value", selfTest: "flag",
+});
+if (args.error) usage(args.error);
+if (args.selfTest) selfTest();
+if (!args.repo) usage("--repo is required");
+if (!["shipped", "caught"].includes(args.mode)) usage("--mode must be shipped or caught");
+if (!args.since || !args.until) usage("--since and --until are required");
+if (!args.out) usage("--out is required");
+
+const limit = Number(args.limit || DEFAULT_LIMIT);
+const roster = makeRoster(args.only);
+if (args.mode === "caught" && roster.isEmpty) usage("--only is required in caught mode");
+
+const authorFilter = String(args.authors || "")
+  .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+
+// `--until` is exclusive so that adjacent windows never double-count a PR.
+const search = `merged:>=${args.since} merged:<${args.until}`;
+const fields = ["number", "title", "body", "url", "author", "labels", "mergedAt", "mergeCommit", "changedFiles", "additions", "deletions", "baseRefName"];
+if (args.mode === "caught") fields.push("reviews");
+
+const prs = ghPrList([
+  "--repo", args.repo, "--state", "merged", "--search", search,
+  "--limit", String(limit), "--json", fields.join(","),
+]);
+
+if (prs.length >= limit) {
+  warn(`--limit ${limit} was reached; the window is truncated and this is a convenience sample, not the full population`);
+}
+
+const authorLogin = (pr) => String(pr.author?.login || "").toLowerCase();
+const inAuthorScope = (pr) => authorFilter.length === 0 || authorFilter.includes(authorLogin(pr));
+
+const scoped = prs.filter(inAuthorScope);
+const droppedByAuthor = prs.length - scoped.length;
+
+let candidates;
+if (args.mode === "shipped") {
+  candidates = scoped
+    .filter((pr) => !UPKEEP_TITLE.test(pr.title || ""))
+    .map((pr) => ({ pr, ...scoreFixSignals(pr) }))
+    .filter((c) => c.score > 0)
+    .map(({ pr, signals, score }) => ({
+      pr: pr.number, url: pr.url, title: pr.title, author: authorLogin(pr),
+      mergedAt: pr.mergedAt, mergeCommit: pr.mergeCommit?.oid || null,
+      baseRef: pr.baseRefName, changedFiles: pr.changedFiles,
+      additions: pr.additions, deletions: pr.deletions,
+      labels: (pr.labels || []).map((l) => l.name), signals, score,
+    }))
+    // Strongest signal first, then smallest diff: a two-file fix blames back to
+    // one origin commit, a two-hundred-file fix blames back to noise.
+    .sort((a, b) => b.score - a.score || a.changedFiles - b.changedFiles);
+} else {
+  candidates = scoped
+    .map((pr) => {
+      const reviews = (pr.reviews || []).filter(
+        (r) => roster.has(r.author?.login) && String(r.body || "").trim().length > 0,
+      );
+      return { pr, reviews };
+    })
+    .filter((c) => c.reviews.length > 0)
+    .map(({ pr, reviews }) => ({
+      pr: pr.number, url: pr.url, title: pr.title, author: authorLogin(pr),
+      mergedAt: pr.mergedAt, mergeCommit: pr.mergeCommit?.oid || null,
+      baseRef: pr.baseRefName, changedFiles: pr.changedFiles,
+      additions: pr.additions, deletions: pr.deletions,
+      labels: (pr.labels || []).map((l) => l.name),
+      reviewers: [...new Set(reviews.map((r) => r.author.login))],
+      reviewBodies: reviews.length,
+    }))
+    .sort((a, b) => b.reviewBodies - a.reviewBodies || a.changedFiles - b.changedFiles);
+}
+
+const out = {
+  schemaVersion: "review-cases-candidates-v1",
+  mode: args.mode,
+  repo: args.repo,
+  window: { field: "merged_at", from: args.since, toExclusive: args.until },
+  authorScope: authorFilter.length ? authorFilter : "all",
+  roster: roster.logins,
+  population: {
+    mergedPrsScanned: prs.length,
+    droppedByAuthorScope: droppedByAuthor,
+    limit,
+    limitReached: prs.length >= limit,
+  },
+  candidateCount: candidates.length,
+  candidates,
+  warnings,
+  generatedAt: new Date().toISOString(),
+};
+
+writeFileSync(args.out, `${JSON.stringify(out, null, 2)}\n`);
+process.stderr.write(
+  `${args.mode}: ${candidates.length} candidate(s) from ${prs.length} merged PR(s) -> ${args.out}\n`,
+);
