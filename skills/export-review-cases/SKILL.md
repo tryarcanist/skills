@@ -43,6 +43,23 @@ The run is read-only. It must not trigger reviews, edit pull requests, post comm
 - Store the structured case file before writing any prose. The Markdown is generated from the cases, never the other way round.
 - Report what was rejected and why, alongside what was exported.
 
+## 0. Check the skill fits this repository
+
+Run this first, every time, on a repository nobody has run it against:
+
+```bash
+node <SKILL_DIR>/scripts/preflight.mjs \
+  --repo <owner/repo> --since 2026-06-01 --until 2026-08-01 \
+  --repo-path <full-clone> [--only "<reviewer-a>,<reviewer-b>"] \
+  --out <RUN_DIR>/preflight.json
+```
+
+It reports clone health, the merge strategy and whether commit ancestry can fire at all, how much of the tree the non-product filter excludes, file types whose comment syntax is unknown, the fix-signal rate, and every bot publishing on pull requests — which is also how you discover the reviewer roster.
+
+Each finding carries a `remedy`. `blocking` means stop; `adjust` means write a config override before trusting the output; `note` means say it in the handover. Most remedies are a few lines in `review-cases.config.json` — see [references/configuration.md](references/configuration.md).
+
+Do not skip this because the run "seems to work". A mismatch does not error; it produces a thin, confident-looking bundle that is indistinguishable from a clean repository.
+
 ## 1. Declare the scope
 
 Fix three things before collecting, and record them.
@@ -51,18 +68,9 @@ Fix three things before collecting, and record them.
 
 **Authors.** `--authors` restricts to specific pull request authors. Use it when the team's habits differ enough to bias the set — for example when one engineer routinely tells their coding agent to address the reviewer's comments and another does not. It filters client-side after collection, so it narrows the corpus rather than widening the search. Say in the report which scope was used.
 
-**Roster.** Discover the reviewer identities from the repository rather than guessing a login:
+**Roster.** `preflight.mjs` lists every bot publishing on pull requests, with a review-body and top-level-comment count for each, and flags active ones missing from `--only`. Take the roster from there rather than guessing a login. A reviewer that publishes its whole verdict as one top-level comment shows as `0r/Nc` — it can produce caught cases but never missed ones, because a comment carries no commit pin.
 
-```bash
-gh pr list --repo <owner/repo> --state merged \
-  --search "merged:>=<since> merged:<<until>" --limit 200 --json number,reviews \
-  --jq '[.[].reviews[].author.login] | group_by(.) | map({login: .[0], reviews: length}) | sort_by(-.reviews)'
-
-gh api "repos/<owner/repo>/issues/comments?per_page=100&since=<since>T00:00:00Z" \
-  --paginate --jq '[.[] | select(.user.type == "Bot") | .user.login] | group_by(.) | map({login: .[0], comments: length})'
-```
-
-Run both. The second one matters: a reviewer that publishes its whole verdict as one top-level comment appears nowhere in the first. Note also that `gh pr list` returns logins **without** the `[bot]` suffix while the REST API returns them **with** it; `--only` accepts either spelling, and some app reviewers have no `[bot]` suffix at all.
+`gh pr list` returns logins **without** the `[bot]` suffix while the REST API returns them **with** it. `--only` accepts either spelling, and some app reviewers genuinely have no suffix.
 
 ## 2. Propose candidates
 
@@ -175,6 +183,23 @@ Without `--include-source` the bundle carries links, SHAs, paths, line numbers, 
 
 Read the rejection list. A high count usually means the adjudication prompt drifted, not that the repository is clean.
 
+## Troubleshooting
+
+The failure mode of this skill is silence, not error. Every symptom below is what a mismatch looks like from the outside.
+
+| Symptom | Likely cause | What to do |
+| --- | --- | --- |
+| Very few shipped candidates | Fix titles do not use English fix words, and there are no bug labels or linked issues | Add `fixSignalsExtra` for the repository's own convention; preflight prints the fix-signal rate |
+| Traces return 0 origins on most fixes | The changed files are all being skipped as non-product | Check `files[].state` in a trace. If product code is landing in `non-product-path`, add `paths.product` |
+| Every reviewer is `false` with `no-published-output-on-this-pr` | Roster login is wrong, or the reviewer publishes on a surface that carries no pin | Check preflight's reviewer list; try the other `[bot]` spelling |
+| Every verdict is `null` with `presence-could-not-be-established` | Reviewed commits are unreachable — usually a rebase-merge repository or fork pull requests | No override fixes this. Say the repository cannot be measured this way |
+| Every verdict is `null` with `no-block-carrying-identifiable-code` | The needle language is unrecognised, so comment masking is over-aggressive; or the fixes are add-only | Add a `languages` entry; if the fixes genuinely only add lines, these are bugs of omission and have no origin |
+| Needles are comments or prose | The language's comment syntax is unknown | Add a `languages` entry for that extension |
+| Many `needleKind: "declaration"` warnings | The repository is config-, schema-, or type-heavy | Read `origins[].buggyBlock` on each before writing a case; add `statementSignalExtra` if the language's logic syntax is missing |
+| `population.complete` is `false` | A single day exceeds `--limit` | Raise `--limit`; the named days are in `subWindowsTruncated` |
+| The bundler rejects nearly everything | Usually the adjudication prompt drifted, or stubs were exported unedited | Read the reasons; they name the field |
+| A case looks right but the bundler says the block is absent at the reviewed commit | The case is wrong, or `provenance.buggyBlock` was edited | Do not edit provenance. Re-derive the case from the trace |
+
 ## 8. Hand it over
 
 The bundle is `manifest.json`, `cases.json`, and `CASES.md`. Send all three; the Markdown is for reading and the JSON is what a vendor can build against.
@@ -182,6 +207,7 @@ The bundle is `manifest.json`, `cases.json`, and `CASES.md`. Send all three; the
 Say plainly, every time:
 
 - how the set was mined, and that it is therefore a lower bound rather than a measurement;
+- any preflight finding you did not resolve, and any config override you applied;
 - the window, whether it was collected completely, the author scope, and the reviewer roster;
 - how many candidates were examined to produce this many cases;
 - how many cases were rejected and why;

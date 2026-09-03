@@ -4,7 +4,7 @@ One JSON file per case, written to `<RUN_DIR>/cases/<caseId>.json`.
 
 **Do not write one by hand.** `emit-case-stub.mjs` fills every mechanical field from the trace or reviews file and leaves the judgement fields as `TODO:` strings. Replace those; keep the rest.
 
-`build-bundle.mjs` validates every file for shape, then re-checks the factual fields against git and GitHub, and refuses the ones that cannot support their own claim.
+`build-bundle.mjs` validates every file for shape, then re-checks the factual fields against git and GitHub, and refuses the ones that cannot support their own claim. It also refuses any field still holding a generated `TODO:` placeholder, at any depth.
 
 ```json
 {

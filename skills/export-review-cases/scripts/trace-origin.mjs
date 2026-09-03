@@ -37,6 +37,8 @@ import {
   ensureCommit, fileAt, git, isAncestor, preImageRanges,
 } from "./lib/git.mjs";
 import { fetchReviewerOutput, reviewedCommitsByReviewer } from "./lib/reviews.mjs";
+import { loadConfig, makePathPolicy } from "./lib/config.mjs";
+import { commentMask, languageFor } from "./lib/lang.mjs";
 
 const DEFAULT_MAX_ORIGINS = 5;
 // A one-line root cause is the most common bug shape there is, and pooling
@@ -73,57 +75,23 @@ const HISTORY_ARTIFACT_SUBJECT =
 const NOISE_LINE =
   /^\s*(?:\/\/|#(?!\s*(?:if|include|define))|\*|\/\*|--|<!--|import\s|from\s+\S+\s+import\s|export\s*\{|use\s+\w|package\s+\w|require\(|@\w+\s*$|[{}()\[\];,]*$)/;
 
-const DOCSTRING_FENCE = /("{3}|'{3})/g;
-
-// Executable logic: a call, a branch, a comparison, an assignment with an
-// operator. Its absence does not disqualify a needle, but its presence is what
-// separates "the code that misbehaves" from "a declaration the fix happened to
-// touch" -- a widened type alias, an interface field, a css rule.
+// Executable logic: a call, a branch, a comparison, an assignment to a member
+// or index, a channel or short-variable operator. Its absence does not
+// disqualify a needle, but its presence is what separates "the code that
+// misbehaves" from "a declaration the fix happened to touch" -- a widened type
+// alias, an interface field, a css rule. Add repo-specific syntax with
+// `statementSignalExtra` in the config file rather than editing this.
 const STATEMENT_SIGNAL =
-  /\b(if|else|for|while|return|throw|await|switch|case|try|catch|finally|yield|raise|assert|def|func|function|lambda|match)\b|=>|->|\w\s*\(|[!<>]=|==|&&|\|\||\?\?|\+=|-=|\.\w+\(|[\w\]\)](?:\.\w+|\[[^\]]+\])\s*=[^=]/;
-
-// Which lines of a file are inside a docstring or block comment.
-//
-// This has to be computed over the whole file, not over the candidate block. A
-// single line lifted from the middle of a docstring carries no fence, so a
-// block-local scan cannot tell prose from code -- and a sentence of
-// documentation then decides whether a reviewer had seen a bug.
-export function commentMask(content) {
-  const lines = String(content || "").split("\n");
-  const mask = new Array(lines.length).fill(false);
-  let inDocstring = false;
-  let inBlockComment = false;
-  lines.forEach((raw, i) => {
-    const line = raw.trim();
-    if (inBlockComment) {
-      mask[i] = true;
-      if (line.includes("*/")) inBlockComment = false;
-      return;
-    }
-    if (inDocstring) {
-      mask[i] = true;
-      if ((line.match(DOCSTRING_FENCE) || []).length % 2 === 1) inDocstring = false;
-      return;
-    }
-    const fences = (line.match(DOCSTRING_FENCE) || []).length;
-    if (fences % 2 === 1) {
-      mask[i] = true;
-      inDocstring = true;
-      return;
-    }
-    if (fences > 0) {
-      mask[i] = true;
-      return;
-    }
-    if (line.includes("/*") && !line.includes("*/")) {
-      mask[i] = true;
-      inBlockComment = true;
-    }
-  });
-  return mask;
-}
+  /\b(if|else|for|while|return|throw|await|switch|case|try|catch|finally|yield|raise|assert|def|func|function|lambda|match|unless|elsif|when)\b|=>|->|<-|:=|\w\s*\(|[!<>]=|==|&&|\|\||\?\?|\+=|-=|\.\w+\(|[\w\]\)](?:\.\w+|\[[^\]]+\])\s*=[^=]/;
 
 // Substantive code lines of one run, given the file's comment mask.
+// Populated once the config is read; empty until then so the exported helpers
+// stay usable from a self-test.
+let extraLanguages = [];
+let extraStatementSignal = null;
+const isStatement = (line) =>
+  STATEMENT_SIGNAL.test(line) || (extraStatementSignal ? extraStatementSignal.test(line) : false);
+
 function runCodeLines(lines, mask, start, end) {
   const out = [];
   for (let n = start; n <= end && n <= lines.length; n += 1) {
@@ -134,29 +102,32 @@ function runCodeLines(lines, mask, start, end) {
   return out;
 }
 
-// Block-local versions, for callers with no surrounding file.
-function codeLines(block) {
+// Block-local versions, for callers with no surrounding file. `path` lets the
+// language table pick the right comment syntax; without one the mask falls back
+// to every style at once, which masks more and invents nothing.
+function codeLines(block, path = "") {
   const lines = String(block || "").split("\n");
-  return runCodeLines(lines, commentMask(block), 1, lines.length);
+  return runCodeLines(lines, commentMask(block, path, extraLanguages), 1, lines.length);
 }
 
 // How much of a block is actually distinguishing code. A needle made of
 // boilerplate answers the presence question by accident, in whichever
 // direction the file happens to fall.
-export function substantiveLength(block) {
-  return codeLines(block).join("\n").length;
+export function substantiveLength(block, path = "") {
+  return codeLines(block, path).join("\n").length;
 }
 
 // Does the block contain executable logic, or only declarations?
-export function needleKind(block) {
-  return codeLines(block).some((l) => STATEMENT_SIGNAL.test(l)) ? "statement" : "declaration";
+export function needleKind(block, path = "") {
+  return codeLines(block, path).some((l) => isStatement(l)) ? "statement" : "declaration";
 }
 
 function usage(msg) {
   if (msg) process.stderr.write(`error: ${msg}\n`);
   process.stderr.write(
     "usage: trace-origin.mjs --repo owner/repo --pr <fix-pr> --only \"bot-a,bot-b\"\n" +
-      "                       [--repo-path .] [--max-origins N] [--min-lines N] [--min-share 0.1] --out file\n" +
+      "                       [--repo-path .] [--max-origins N] [--min-lines N] [--min-share 0.1]\n" +
+      "                       [--config review-cases.config.json] --out file\n" +
       "       trace-origin.mjs --self-test\n",
   );
   process.exit(2);
@@ -182,7 +153,7 @@ function selfTest() {
   eq("a normal fix subject is not", HISTORY_ARTIFACT_SUBJECT.test("Fix stale cache key after fallback"), false);
   eq("an import line is not substantive", substantiveLength('import { a, b, c } from "some/long/module/path";'), 0);
   eq("a comment line is not substantive", substantiveLength("// Yield so the first run entered the workflow and claimed the slot."), 0);
-  eq("a docstring line is not substantive", substantiveLength('"""Create an organization in the database for integration tests."""'), 0);
+  eq("a docstring line is not substantive", substantiveLength('"""Create an organization in the database for integration tests."""', "a.py"), 0);
   eq("real code is substantive", substantiveLength("if (!member) return { ok: true };\n  ledger.record(member.id, now);") >= MIN_BLOCK_CHARS, true);
   eq("prose inside a docstring is not substantive",
     substantiveLength('"""\nRetries are dispatched hourly so that a failed report is picked up\nby the next scheduled run without operator action.\n"""'), 0);
@@ -207,6 +178,13 @@ function selfTest() {
     '    """',
     '    response.headers["Cache-Control"] = "public, max-age=3600"',
   ].join("\n");
+  eq("a ruby =begin block is masked", commentMask(["def f", "=begin", "prose", "=end", "1"].join("\n"), "a.rb").map((m) => (m ? 1 : 0)), [0, 1, 1, 1, 0]);
+  eq("a lua long comment is masked, not read as a line comment",
+    commentMask(["local a", "--[[", "prose", "]]", "local b"].join("\n"), "a.lua").map((m) => (m ? 1 : 0)), [0, 1, 1, 1, 0]);
+  eq("an unknown extension masks conservatively",
+    commentMask(["code", "% prose", "code"].join("\n"), "a.unknownext").map((m) => (m ? 1 : 0)), [0, 1, 0]);
+  eq("go short assignment reads as a statement", needleKind("count := len(rows)\nif count > cap { return errTooMany }", "a.go"), "statement");
+  eq("a ruby guard reads as a statement", needleKind("raise ArgumentError unless member.admin?", "a.rb"), "statement");
   eq("a docstring interior is masked across the whole file",
     commentMask(pyFile).map((m) => (m ? 1 : 0)), [0, 1, 1, 1, 1, 1, 0]);
 
@@ -226,7 +204,8 @@ function squashPrNumber(subject) {
 
 const args = parseArgs(process.argv.slice(2), {
   repo: "value", pr: "value", only: "value", repoPath: "value",
-  maxOrigins: "value", minLines: "value", minShare: "value", out: "value", selfTest: "flag",
+  maxOrigins: "value", minLines: "value", minShare: "value", config: "value",
+  out: "value", selfTest: "flag",
 });
 if (args.error) usage(args.error);
 if (args.selfTest) selfTest();
@@ -244,6 +223,14 @@ const prNum = String(args.pr).match(/(\d+)(?!.*\d)/)?.[1];
 if (!prNum) usage(`could not read a PR number from ${args.pr}`);
 
 assertUsableClone(repoPath);
+
+const config = loadConfig({ explicit: args.config, repoPath });
+for (const problem of config.problems) warn(`config: ${problem}`);
+if (config.source) process.stderr.write(`using overrides from ${config.source}\n`);
+extraLanguages = config.languages || [];
+if (config.statementSignalExtra) extraStatementSignal = new RegExp(config.statementSignalExtra);
+const minBlockChars = config.minBlockChars ?? MIN_BLOCK_CHARS;
+const pathPolicy = makePathPolicy(NON_PRODUCT_PATH, config);
 
 const fixPr = ghOne(`repos/${args.repo}/pulls/${prNum}`);
 if (!fixPr) usage(`PR ${prNum} could not be read`);
@@ -294,7 +281,7 @@ for (const file of files) {
     fileObservations.push({ path: file.filename, prePath, status: file.status, state: "uninformative-path" });
     continue;
   }
-  if (NON_PRODUCT_PATH.test(prePath)) {
+  if (pathPolicy.isNonProduct(prePath)) {
     fileObservations.push({ path: file.filename, prePath, status: file.status, state: "non-product-path" });
     continue;
   }
@@ -385,21 +372,31 @@ function bestBlock(stat) {
   for (const option of options) {
     if (!fileCache.has(option.path)) {
       const text = fileAt(repoPath, preFixSha, option.path);
-      fileCache.set(option.path, text === null ? null : { lines: text.split("\n"), mask: commentMask(text) });
+      fileCache.set(
+        option.path,
+        text === null
+          ? null
+          : {
+              lines: text.split("\n"),
+              mask: commentMask(text, option.path, extraLanguages),
+              language: languageFor(option.path, extraLanguages),
+            },
+      );
     }
     const file = fileCache.get(option.path);
     if (file === null) continue;
     const block = file.lines.slice(option.run.start - 1, option.run.end).join("\n");
     const kept = runCodeLines(file.lines, file.mask, option.run.start, option.run.end);
     const weight = kept.join("\n").length;
-    const kind = kept.some((l) => STATEMENT_SIGNAL.test(l)) ? "statement" : "declaration";
-    if (weight < MIN_BLOCK_CHARS) {
+    const kind = kept.some((l) => isStatement(l)) ? "statement" : "declaration";
+    if (weight < minBlockChars) {
       rejected.push({ path: option.path, start: option.run.start, end: option.run.end, substantiveChars: weight, needleKind: kind });
       continue;
     }
     usable.push({
       path: option.path, start: option.run.start, end: option.run.end,
       block, substantiveChars: weight, needleKind: kind,
+      languageRecognised: file.language.matched, languageExt: file.language.ext,
       lines: option.run.end - option.run.start + 1,
     });
   }
@@ -573,7 +570,15 @@ const out = {
   preFix: { sha: preFixSha, source: preFixSource },
   files: fileObservations,
   totalBlamedLines,
-  thresholds: { maxOrigins, minLines, minShare, minBlockChars: MIN_BLOCK_CHARS },
+  thresholds: { maxOrigins, minLines, minShare, minBlockChars },
+  config: config.source ? { source: config.source, paths: pathPolicy.describe(), problems: config.problems } : null,
+  unrecognisedLanguages: [
+    ...new Set(
+      origins
+        .filter((o) => o.buggyBlock && o.buggyBlock.languageRecognised === false)
+        .map((o) => o.buggyBlock.languageExt || "(no extension)"),
+    ),
+  ],
   presenceMethodCounts,
   historyArtefactsExcluded: artefacts.map((a) => ({ sha: a.sha, lines: a.lines, subject: a.subject })),
   origins,

@@ -24,6 +24,7 @@
 
 import { writeFileSync } from "node:fs";
 import { ghPrList, makeRoster, parseArgs, validateWindow, warn, warnings } from "./lib/gh.mjs";
+import { loadConfig } from "./lib/config.mjs";
 
 const DEFAULT_LIMIT = 1000;
 const MIN_SPLIT_DAYS = 1;
@@ -44,13 +45,37 @@ const FIX_SIGNALS = [
 // adjudication pass.
 const UPKEEP_TITLE = /^(chore|docs?|style|refactor|test|ci|build|deps?|dependabot|bump|release|version|merge branch|revert "revert)\b/i;
 
+// Repo-specific signals from the config file are compiled into the same shape,
+// so a repository that names pull requests by ticket id alone can be scored
+// without editing this file. `field` is title, body, or label.
+export function compileExtraSignals(extras, onProblem) {
+  const out = [];
+  for (const extra of extras || []) {
+    try {
+      const re = new RegExp(extra.pattern, "i");
+      const field = ["title", "body", "label"].includes(extra.field) ? extra.field : "title";
+      out.push({
+        name: extra.name || `config:${field}`,
+        weight: Number(extra.weight) || 1,
+        test: (t) =>
+          field === "label" ? t.labelText.some((l) => re.test(l)) : re.test(field === "body" ? t.body : t.title),
+      });
+    } catch (e) {
+      onProblem(`fixSignalsExtra ${JSON.stringify(extra).slice(0, 60)}: ${e.message}`);
+    }
+  }
+  return out;
+}
+
+let activeSignals = FIX_SIGNALS;
+
 function scoreFixSignals(pr) {
   const target = {
     title: pr.title || "",
     body: pr.body || "",
     labelText: (pr.labels || []).map((l) => l.name || ""),
   };
-  const signals = FIX_SIGNALS.filter((s) => s.test(target));
+  const signals = activeSignals.filter((s) => s.test(target));
   return { signals: signals.map((s) => s.name), score: signals.reduce((n, s) => n + s.weight, 0) };
 }
 
@@ -78,6 +103,16 @@ function selfTest() {
   eq("upkeep titles are recognised", ["chore: bump deps", "docs: readme", "Refactor client"].map((t) => UPKEEP_TITLE.test(t)), [true, true, true]);
   eq("a real fix title is not upkeep", UPKEEP_TITLE.test("Fix stale cache key after fallback"), false);
   eq("symptom words alone still qualify", scoreFixSignals({ title: "Stop the duplicate webhook", body: "", labels: [] }).score > 0, true);
+  const extra = compileExtraSignals(
+    [{ name: "jira-defect", weight: 3, field: "title", pattern: "^DEF-\\d+" },
+     { name: "bad-regex", weight: 1, field: "title", pattern: "(unclosed" }],
+    () => {},
+  );
+  eq("a valid config signal compiles and an invalid one is dropped", extra.length, 1);
+  eq("a config signal matches its field",
+    extra[0].test({ title: "DEF-4102 correct the payout split", body: "", labelText: [] }), true);
+  eq("a config signal does not match other text",
+    extra[0].test({ title: "Add export button", body: "DEF-4102", labelText: [] }), false);
 
   for (const c of cases) process.stdout.write(`${c.ok ? "ok  " : "FAIL"} ${c.name}\n`);
   const failed = cases.filter((c) => !c.ok);
@@ -87,7 +122,7 @@ function selfTest() {
 
 const args = parseArgs(process.argv.slice(2), {
   repo: "value", mode: "value", since: "value", until: "value",
-  authors: "value", only: "value", limit: "value", out: "value", selfTest: "flag",
+  authors: "value", only: "value", limit: "value", config: "value", out: "value", selfTest: "flag",
 });
 if (args.error) usage(args.error);
 if (args.selfTest) selfTest();
@@ -98,6 +133,12 @@ if (!args.out) usage("--out is required");
 
 const windowProblems = validateWindow(args.since, args.until);
 if (windowProblems.length) usage(windowProblems.join("; "));
+
+const config = loadConfig({ explicit: args.config });
+for (const problem of config.problems) warn(`config: ${problem}`);
+const extraSignals = compileExtraSignals(config.fixSignalsExtra, (p) => warn(`config: ${p}`));
+activeSignals = [...FIX_SIGNALS, ...extraSignals];
+if (config.source) process.stderr.write(`using overrides from ${config.source} (${extraSignals.length} extra fix signal(s))\n`);
 
 const limit = Number(args.limit || DEFAULT_LIMIT);
 const roster = makeRoster(args.only);
@@ -284,6 +325,7 @@ const out = {
   window: { field: "merged_at", from: args.since, toExclusive: args.until },
   authorScope: authorFilter.length ? authorFilter : "all",
   roster: roster.logins,
+  configSource: config.source,
   population: {
     mergedPrsScanned: prs.length,
     droppedByAuthorScope: droppedByAuthor,

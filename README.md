@@ -42,6 +42,8 @@ cp -R skills/audit-code-reviewers .agents/skills/
 
 Build a shareable set of paired pull requests: a bug that shipped past an AI code reviewer, and the later pull request that fixed it — alongside the bugs the reviewer did catch.
 
+- A preflight step reports whether the skill's assumptions fit your repository before you trust its output.
+- Conventions it gets wrong — where tests live, how fixes are titled, how a language writes a comment — are fixed in a config file, not in skill code.
 - The set is mined backwards from merged fixes, so it can surface bugs no reviewer ever mentioned.
 - Each missed case names the exact commit the reviewer read and proves the buggy lines already existed there.
 - Presence is established by commit ancestry or by verbatim content, so squash-merge repositories work too.
@@ -72,6 +74,13 @@ cp -R skills/export-review-cases .agents/skills/
 
 ```text
 /export-review-cases owner/repo --since 2026-08-01 --until 2026-09-01
+```
+
+Start with the preflight, which tells you how well the defaults suit the repository:
+
+```bash
+node skills/export-review-cases/scripts/preflight.mjs \
+  --repo owner/repo --since 2026-08-01 --until 2026-09-01 --repo-path .
 ```
 
 Requires authenticated `gh` with read access to the target repository. The audit is read-only and does not trigger reviews or modify pull requests.
