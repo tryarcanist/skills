@@ -1,4 +1,4 @@
 interface:
-  display_name: "Export Review Cases"
-  short_description: "Bugs a reviewer missed, paired with their fixes"
-  default_prompt: "Use $export-review-cases to build a case set of bugs the AI code reviewer on this repository missed and bugs it caught, each paired with the merged pull request that fixed it."
+  display_name: "Find Review Cases"
+  short_description: "Where an AI reviewer did well, and where it didn't"
+  default_prompt: "Use $export-review-cases to find concrete cases where the AI code reviewer on this repository caught a real bug and where it missed one, with evidence for each."

@@ -40,21 +40,13 @@ cp -R skills/audit-code-reviewers .agents/skills/
 
 ### `export-review-cases`
 
-Build a shareable set of paired pull requests: a bug that shipped past an AI code reviewer, and the later pull request that fixed it — alongside the bugs the reviewer did catch.
+Find concrete cases where an AI code reviewer did well and where it did badly on a repository, each backed by evidence you can check.
 
-- A preflight step reports whether the skill's assumptions fit your repository before you trust its output.
-- Conventions it gets wrong — where tests live, how fixes are titled, how a language writes a comment — are fixed in a config file, not in skill code.
-- The set is mined backwards from merged fixes, so it can surface bugs no reviewer ever mentioned.
-- Each missed case names the exact commit the reviewer read and proves the buggy lines already existed there.
-- Presence is established by commit ancestry or by verbatim content, so squash-merge repositories work too.
-- Tests, fixtures, comments and imports cannot decide whether a reviewer saw a bug.
-- "The reviewer read this and the bug was not there" and "nothing is known" stay separate answers.
-- The window is collected completely rather than truncated to its most recent days.
-- Cases are generated as stubs from the evidence, not written by hand.
-- A second reader has to try to overturn every case, and the bundler re-checks each one against the code before export.
-- Source patches are opt-in, and scoped to the files each case names.
-- The bundle is a lower bound on what happened, not a recall measurement, and it says so.
-- The skill only requires authenticated `gh`, `git`, and Node.js, run from a full clone.
+- Starts from the reviewer's own reviews, which is the entire eligible population and one query.
+- Judges every finding at the exact commit the reviewer saw, not at current head.
+- Uses human replies and follow-up commits to separate real catches from noise.
+- Distinguishes "never looked" from "looked and drew the wrong conclusion" by reading the review body.
+- Produces a few well-evidenced cases, not a score. It says so.
 
 **Install (Claude Code):**
 
@@ -73,8 +65,9 @@ cp -R skills/export-review-cases .agents/skills/
 **Run:**
 
 ```text
-/export-review-cases owner/repo --since 2026-08-01 --until 2026-09-01
+/export-review-cases owner/repo for reviewer <bot-login>
 ```
+
 
 Start with the preflight, which tells you how well the defaults suit the repository:
 
