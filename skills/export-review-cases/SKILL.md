@@ -21,7 +21,7 @@ gh api "search/issues?q=repo:<owner/repo>+is:pr+reviewed-by:<bot-login>&per_page
   --jq '.items[] | {n:.number, t:.title, merged:(.pull_request.merged_at != null)}'
 ```
 
-It is usually small — on one customer repository it was 41 pull requests against thousands merged. Small enough to look at all of them, which is the point: nothing has to be inferred or sampled.
+It is usually a small fraction of what the repository merges, and often small enough to look at every one. That is the point: nothing has to be inferred or sampled.
 
 Then, per pull request, collect what it said and what happened next: `pulls/<n>/reviews` (review bodies), `pulls/<n>/comments` (inline findings — `original_commit_id` is the commit each was written against), `issues/<n>/comments` (some reviewers publish everything here), plus human replies and the PR's commits with timestamps.
 
@@ -40,15 +40,26 @@ For a **good** case, establish: the defect was real at the commit the reviewer s
 
 For a **bad** case, establish: the code was there at the commit the reviewer saw, something later repaired it, and what the reviewer would have had to do differently. A fix landing in the same pull request shortly after a clean verdict is excellent evidence — better than a fix months later on the default branch, because there is no ambiguity about what was being fixed.
 
-Also read the reviewer's own review body on the misses. The most useful case found this way was one where the reviewer had *tested the exact scenario*, described the mechanism correctly, and then classified it as intended behaviour. "It never looked" and "it looked and drew the wrong conclusion" are different product problems, and only the review body distinguishes them.
+Always read the reviewer's own review body on a miss. The most valuable case of all is the one where the reviewer *tested the exact scenario*, described the mechanism correctly, and then classified it as intended behaviour — usually by taking a code comment as the specification. "It never looked" and "it looked and drew the wrong conclusion" are different product problems, and only the review body tells them apart.
+
+## Use subagents
+
+Reading one pull request properly — the diff at the reviewed commit, the review body, the replies, the commits that followed — is most of the work here, and it parallelises cleanly. Hand one pull request to one subagent, with the same instructions every time, so the verdicts that come back can sit in the same writeup.
+
+Two roles worth spending an extra agent on:
+
+- **A skeptic**, before you keep any case. Its only job is to overturn it: was the code really there at that commit, did the reviewer really not mention it anywhere including a long summary body, is the commit credited as the fix really fixing this. A case that survives is worth sending; one that does not would have been a false accusation, and finding that out yourself is much cheaper than having the vendor find it. Use a fresh agent — the one that wrote the case will agree with itself.
+- **A cold reader**, when you want to know what everyone missed. Have it find defects in the diff *before* it sees any reviewer output. Once it has read the reviewer it will anchor on that framing and stop looking.
+
+Keep the judgement in one place. Subagents gather and challenge; you decide which cases to keep and write them up, or the set will not hold together.
 
 ## Things that will bite
 
 - **Judge at the commit the reviewer saw, never at head.** GitHub re-anchors inline comments as a pull request evolves, so the line a comment points at today may not be the line it was written against. Use `original_commit_id` and `git show <sha>:<path>`.
-- **Those commits are often not in your clone.** After a squash merge the reviewed commits are not reachable from the default branch — on one repository 44 of 60 were missing. Fetch them: `git fetch origin <full-sha>`, or `git fetch origin refs/pull/<n>/head` once the branch is deleted. Full SHAs only; `git fetch` cannot resolve an abbreviated one. A fetch that fails on credentials looks identical to a commit that is genuinely gone — check which you have before recording a case as unverifiable.
+- **Those commits are often not in your clone, and on a squash-merging repository most of them will not be.** Reviewed commits sit on pull request branches and are not reachable from the default branch. Fetch them: `git fetch origin <full-sha>`, or `git fetch origin refs/pull/<n>/head` once the branch is deleted. Full SHAs only; `git fetch` cannot resolve an abbreviated one. A fetch that fails on credentials looks identical to a commit that is genuinely gone — check which you have before recording a case as unverifiable.
 - **A force-pushed commit may be unreachable for good.** Say so rather than judging against head.
-- **The reviewer's claims are candidates, not truth**, in both directions. A confident finding can be wrong; the strongest case found this way was a reviewer's own claim that its verdict *held*.
-- **A finding can be true and worthless.** Seven findings against a gitignored single-commit scratch directory were all technically correct and all noise. Check what the file is for before counting a finding against the reviewer either way.
+- **The reviewer's claims are candidates, not truth**, in both directions. A confident finding can be wrong, and so can a confident all-clear.
+- **A finding can be true and worthless.** A batch of technically correct findings against an excluded scratch tree, a vendored copy, or generated output is noise, and a team is right to ignore it. Check what the file is for before counting a finding either way.
 - **Human silence proves nothing.** Teams fix nits to clear a queue and ignore real bugs to ship.
 - **Agent-drafted replies.** "Fixed in `<sha>`" replies are increasingly written by coding agents. Check the SHA contains the described change before treating the reply as agreement.
 
