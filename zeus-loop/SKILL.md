@@ -13,13 +13,15 @@ Review, fix, push, repeat until Arcanist says **Ready to merge** or the lap cap 
 node <skill-dir>/scripts/zeus-review.mjs <pr-url|pr-number> [--repo owner/repo] [--app arcanist|arcanist-qa]
 ```
 
-Exit 0 means no blocking finding, 1 means a blocking finding, 2 a tool error, 3 a timeout (30 min default). The JSON carries `headline`, `blocking`, and `findings[]` with `file`, `line`, `title`, `body`, `blocksMerge`, `threadId`.
+Exit 0 means no blocking finding, 1 means a blocking finding, 2 a tool error, 3 a timeout (30 min default). The JSON carries `headSha` (the reviewed commit), `headline`, `blocking`, and `findings[]` with `file`, `line`, `title`, `body`, `blocksMerge`, `threadId`.
+
+Two flags change what "one review" means. `--no-trigger` waits for a review that is already running instead of asking for one: use it right after opening a PR, since Arcanist reviews every new PR on its own. `--any-head` accepts a completed review on an earlier commit of the PR, because Arcanist does not re-review every push; the result's `headSha` says which commit it read.
 
 ## Loop
 
 Keep a ledger across laps: finding title + file, and what you did about it. Cap: 5 laps.
 
-1. **Review the current head.** Run the script. On exit 2 or 3, stop and report the stderr line.
+1. **Review the current head.** On the first lap of a PR Arcanist just reviewed on its own, add `--no-trigger --any-head`. Every later lap runs plain. On exit 2 or 3, stop and report the stderr line.
 2. **Done check.** `blocking: false` and no unresolved finding you still owe a reply: stop, report the headline and the head SHA.
 3. **Dispose of every finding**, blocking or not, one at a time:
    - A real defect: fix it at the cause. Run the repo's own checks for the touched files.

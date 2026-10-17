@@ -9,6 +9,12 @@
 // Output (stdout, one JSON object):
 //   { backend, repo, pr, headSha, verdict, headline, blocking, findings: [{ file, line, title, body, blocksMerge, threadId }] }
 // Exit codes: 0 no blocking finding, 1 blocking finding, 2 usage or tool error, 3 timeout.
+//
+// --no-trigger  wait for a review that is already running instead of asking for one.
+// --any-head    accept a completed review on an earlier commit of the PR (Arcanist reviews a PR
+//               on open and does not re-review every push); the result names the reviewed head.
+// --app arcanist-qa targets Arcanist's QA deployment. With the cli backend that needs
+//               ARCANIST_API_URL pointing at the QA host and a matching ARCANIST_TOKEN.
 
 import { execFileSync, spawnSync } from "node:child_process";
 
@@ -22,13 +28,13 @@ const HOLD_HEADLINE = "Hold off on merging";
 function usage(message) {
   if (message) process.stderr.write(`error: ${message}\n`);
   process.stderr.write(
-    "usage: zeus-review.mjs [<pr-url|number>] [--repo owner/repo] [--backend auto|cli|gh] [--app arcanist|arcanist-qa] [--timeout seconds] [--interval seconds] [--no-trigger]\n",
+    "usage: zeus-review.mjs [<pr-url|number>] [--repo owner/repo] [--backend auto|cli|gh] [--app arcanist|arcanist-qa] [--timeout seconds] [--interval seconds] [--no-trigger] [--any-head]\n",
   );
   process.exit(2);
 }
 
 function parseArgs(argv) {
-  const out = { backend: "auto", app: "arcanist", timeout: 1800, interval: 30, trigger: true };
+  const out = { backend: "auto", app: "arcanist", timeout: 1800, interval: 30, trigger: true, anyHead: false };
   const positional = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -38,6 +44,7 @@ function parseArgs(argv) {
     else if (arg === "--timeout") out.timeout = Number(argv[(i += 1)]);
     else if (arg === "--interval") out.interval = Number(argv[(i += 1)]);
     else if (arg === "--no-trigger") out.trigger = false;
+    else if (arg === "--any-head") out.anyHead = true;
     else if (arg.startsWith("--")) usage(`unknown flag ${arg}`);
     else positional.push(arg);
   }
@@ -163,24 +170,40 @@ function completedCheck(repo, sha, app) {
   return out.length > 0 ? out.split("\n")[0] : null;
 }
 
+function prCommitShas(repo, pr) {
+  // Newest first, so the latest reviewed commit wins.
+  return JSON.parse(gh(["pr", "view", String(pr), "--repo", repo, "--json", "commits", "--jq", "[.commits[].oid]"])).reverse();
+}
+
+// The reviewed sha and its conclusion, or null. With anyHead, any commit of the PR counts.
+function findCompleted(repo, pr, head, app, anyHead) {
+  const candidates = anyHead ? [head, ...prCommitShas(repo, pr).filter((sha) => sha !== head)] : [head];
+  for (const sha of candidates) {
+    const conclusion = completedCheck(repo, sha, app);
+    if (conclusion) return { sha, conclusion };
+  }
+  return null;
+}
+
 function reviewViaGh(repo, pr, options) {
   const app = APPS[options.app];
-  const sha = headSha(repo, pr);
+  const head = headSha(repo, pr);
   const deadline = Date.now() + options.timeout * 1000;
-  if (!completedCheck(repo, sha, app) && options.trigger) {
+  let done = findCompleted(repo, pr, head, app, options.anyHead);
+  if (!done && options.trigger) {
     gh(["pr", "comment", String(pr), "--repo", repo, "--body", app.mention]);
-    process.stderr.write(`posted "${app.mention}" on ${repo}#${pr} head ${sha.slice(0, 7)}\n`);
+    process.stderr.write(`posted "${app.mention}" on ${repo}#${pr} head ${head.slice(0, 7)}\n`);
   }
-  let conclusion = completedCheck(repo, sha, app);
-  while (!conclusion) {
+  while (!done) {
     if (Date.now() > deadline) {
-      process.stderr.write(`timed out after ${options.timeout}s waiting for "${app.check}" on ${sha.slice(0, 7)}\n`);
+      process.stderr.write(`timed out after ${options.timeout}s waiting for "${app.check}" on ${head.slice(0, 7)}\n`);
       process.exit(3);
     }
-    process.stderr.write(`waiting for "${app.check}" on ${sha.slice(0, 7)}\n`);
+    process.stderr.write(`waiting for "${app.check}" on ${head.slice(0, 7)}\n`);
     sleep(options.interval);
-    conclusion = completedCheck(repo, sha, app);
+    done = findCompleted(repo, pr, head, app, options.anyHead);
   }
+  const { sha, conclusion } = done;
   // The summary comment lands right after the check completes; give it a few polls.
   let summary = summaryFor(repo, pr, app, sha);
   for (let attempt = 0; !summary && attempt < 6; attempt += 1) {
@@ -202,7 +225,7 @@ function reviewViaGh(repo, pr, options) {
   };
 }
 
-function reviewViaCli(repo, pr) {
+function reviewViaCli(repo, pr, app) {
   const url = `https://github.com/${repo}/pull/${pr}`;
   const result = spawnSync("arcanist", ["review", url, "--wait", "--json"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
   if (result.error) usage(`arcanist failed to start: ${result.error.message}`);
@@ -217,7 +240,7 @@ function reviewViaCli(repo, pr) {
   const findings = payload.findings ?? [];
   const blocking = findings.some((finding) => finding.blocksMerge === true);
   // Thread ids come from GitHub so the loop can resolve them after a fix.
-  const threads = unresolvedThreads(repo, pr, APPS.arcanist.bot);
+  const threads = unresolvedThreads(repo, pr, app.bot);
   const threadFor = (finding) =>
     threads.find((thread) => thread.file === finding.file && (thread.line === finding.line || thread.title === finding.title))?.threadId ?? null;
   return {
@@ -243,7 +266,9 @@ function reviewViaCli(repo, pr) {
 const options = parseArgs(process.argv.slice(2));
 const { repo, pr } = resolvePr(options.pr, options.repo);
 const backend = options.backend === "auto" ? (options.app === "arcanist" && cliAvailable() ? "cli" : "gh") : options.backend;
-if (backend === "cli" && options.app !== "arcanist") usage("the cli backend reviews with the production app only; drop --app or use --backend gh");
-const result = backend === "cli" ? reviewViaCli(repo, pr) : reviewViaGh(repo, pr, options);
+if (backend === "cli" && options.app === "arcanist-qa" && !/\/\/qa\./.test(process.env.ARCANIST_API_URL ?? "")) {
+  usage("--app arcanist-qa with the cli backend needs ARCANIST_API_URL set to the QA host (and a QA ARCANIST_TOKEN)");
+}
+const result = backend === "cli" ? reviewViaCli(repo, pr, APPS[options.app]) : reviewViaGh(repo, pr, options);
 process.stdout.write(JSON.stringify(result, null, 2) + "\n");
 process.exitCode = result.blocking ? 1 : 0;
