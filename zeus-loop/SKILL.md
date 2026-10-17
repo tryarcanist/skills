@@ -7,7 +7,7 @@ description: Loop an Arcanist (Zeus) review on a pull request until it says Read
 
 Review, fix, push, repeat until Arcanist says **Ready to merge** or the lap cap stops you.
 
-`scripts/zeus-review.mjs` runs one review and prints one JSON object. It picks the backend on its own: the `arcanist` CLI when it is installed and logged in, else `gh` (it comments `@tryarcanist /review`, waits on the `Arcanist review` check, and reads the summary and inline threads). Pass `--backend gh` or `--backend cli` to force one. Needs `node` 22+ and an authenticated `gh`.
+The script `zeus-review.mjs` in this skill's `scripts` folder runs one review and prints one JSON object. It picks the backend on its own: the `arcanist` CLI when it is installed and logged in, else `gh` (it comments `@tryarcanist /review`, waits on the `Arcanist review` check, and reads the summary and inline threads). Pass `--backend gh` or `--backend cli` to force one. Needs `node` 22+ and an authenticated `gh`.
 
 ```bash
 node <skill-dir>/scripts/zeus-review.mjs <pr-url|pr-number> [--repo owner/repo] [--app arcanist|arcanist-qa]
