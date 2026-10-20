@@ -17,6 +17,21 @@ mkdir -p ~/.claude/skills && ln -s ~/.arcanist-skills/zeus-loop ~/.claude/skills
 
 Codex: link the same folder into `~/.codex/skills/`. Then ask the agent to "run the zeus loop on this PR".
 
+Devin and Cursor read `~/.agents/skills/<name>/SKILL.md`:
+
+```bash
+git clone https://github.com/tryarcanist/skills ~/.arcanist-skills
+mkdir -p ~/.agents/skills && ln -s ~/.arcanist-skills/zeus-loop ~/.agents/skills/zeus-loop
+```
+
+To run the loop on every PR the agent opens, add an always-on rule to the repository, `.windsurf/rules/arcanist.md` (Devin) or `.cursor/rules/arcanist.md` (Cursor):
+
+```markdown
+After you open or update a pull request on this repository, run the `zeus-loop` skill. Merge when it reports Ready to merge.
+```
+
+The loop merges only when the rule or the person says so.
+
 ## Requirements
 
 - `node` 22 or newer, and an authenticated `gh` CLI.

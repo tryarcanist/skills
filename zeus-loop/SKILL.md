@@ -21,8 +21,11 @@ Two flags change what "one review" means. `--no-trigger` waits for a review that
 
 Keep a ledger across laps: finding title + file, and what you did about it. Cap: 5 laps.
 
+One writer per branch. While the loop runs, nothing else may push to the PR branch. An agent with its own PR monitor turns it off first: Devin ticks `Disable automatic comment, CI, and merge conflict monitoring` on its PR comment before lap 1. Two writers race, and a push after **Ready to merge** lands unreviewed.
+
 1. **Review the current head.** On the first lap of a PR Arcanist just reviewed on its own, add `--no-trigger --any-head`. Every later lap runs plain. On exit 2 or 3, stop and report the stderr line.
 2. **Done check.** `blocking: false` and no unresolved finding you still owe a reply: stop, report the headline and the head SHA.
+   **Merge, when asked.** Arm auto-merge only when the person or the playbook that started the loop said to merge. Then, on a PR that is not a draft: `gh pr merge <pr> --auto --squash`, and confirm with `gh pr view <pr> --json autoMergeRequest` (non-null). GitHub merges once the required checks pass. Report the arm in the final report.
 3. **Dispose of every finding**, blocking or not, one at a time:
    - A real defect: fix it at the cause. Run the repo's own checks for the touched files.
    - A wrong or non-applicable finding: reply on the thread with the one-line reason and the evidence (a file and line, a command output). Resolve the thread.
