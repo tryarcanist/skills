@@ -17,11 +17,22 @@
 //               ARCANIST_API_URL pointing at the QA host and a matching ARCANIST_TOKEN.
 
 import { execFileSync, spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const APPS = {
   // REST reports the bot as "arcanist[bot]"; GraphQL reports it as "arcanist". `botLogin` matches both.
-  arcanist: { bot: "arcanist[bot]", check: "Arcanist review", marker: "arcanist-zeus:v1", mention: "@tryarcanist /review" },
-  "arcanist-qa": { bot: "arcanist-qa[bot]", check: "Arcanist review (qa)", marker: "arcanist-zeus-qa:v1", mention: "@arcanist-qa /review" },
+  arcanist: {
+    bot: "arcanist[bot]",
+    check: "Arcanist review",
+    marker: "arcanist-zeus:v1",
+    mention: "@tryarcanist /review",
+  },
+  "arcanist-qa": {
+    bot: "arcanist-qa[bot]",
+    check: "Arcanist review (qa)",
+    marker: "arcanist-zeus-qa:v1",
+    mention: "@arcanist-qa /review",
+  },
 };
 const HOLD_HEADLINE = "Hold off on merging";
 
@@ -77,7 +88,14 @@ function gh(args) {
 function resolvePr(input, repoFlag) {
   const match = input ? /github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/.exec(input) : null;
   if (match) return { repo: match[1].replace(/\.git$/, ""), pr: Number(match[2]) };
-  const viewArgs = ["pr", "view", ...(input ? [input] : []), ...(repoFlag ? ["--repo", repoFlag] : []), "--json", "number,url"];
+  const viewArgs = [
+    "pr",
+    "view",
+    ...(input ? [input] : []),
+    ...(repoFlag ? ["--repo", repoFlag] : []),
+    "--json",
+    "number,url",
+  ];
   const view = JSON.parse(gh(viewArgs));
   const fromUrl = /github\.com\/([^/]+\/[^/]+)\/pull\//.exec(view.url);
   return { repo: fromUrl[1], pr: view.number };
@@ -132,7 +150,18 @@ function unresolvedThreads(repo, pr, bot) {
   const threads = [];
   let after = null;
   for (;;) {
-    const args = ["api", "graphql", "-f", `query=${query}`, "-F", `owner=${owner}`, "-F", `name=${name}`, "-F", `pr=${pr}`];
+    const args = [
+      "api",
+      "graphql",
+      "-f",
+      `query=${query}`,
+      "-F",
+      `owner=${owner}`,
+      "-F",
+      `name=${name}`,
+      "-F",
+      `pr=${pr}`,
+    ];
     if (after) args.push("-F", `after=${after}`);
     const page = JSON.parse(gh(args)).data.repository.pullRequest.reviewThreads;
     threads.push(...page.nodes);
@@ -143,19 +172,36 @@ function unresolvedThreads(repo, pr, bot) {
     .filter((thread) => !thread.isResolved && botLogin(thread.comments.nodes[0]?.author?.login) === botLogin(bot))
     .map((thread) => {
       const body = cleanFindingBody(thread.comments.nodes[0].body);
-      return { file: thread.path, line: thread.line ?? thread.originalLine ?? null, title: titleOf(body), body, threadId: thread.id };
+      return {
+        file: thread.path,
+        line: thread.line ?? thread.originalLine ?? null,
+        title: titleOf(body),
+        body,
+        threadId: thread.id,
+      };
     });
 }
 
-function summaryFor(repo, pr, app, sha) {
+function summaryFromComment(comment, app, sha, anyHead) {
+  if (comment.user?.login !== app.bot) return null;
+  const body = comment.body ?? "";
+  const marker = app.marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const exactRe = new RegExp(`<!-- ${marker} [^>]*head=${sha} verdict=(\\w+) -->`);
+  const anyRe = new RegExp(`<!-- ${marker} [^>]*head=([0-9a-f]+) verdict=(\\w+) -->`);
+  const exact = exactRe.exec(body);
+  const any = anyHead ? anyRe.exec(body) : null;
+  const match = exact ?? any;
+  if (!match) return null;
+  const verdict = exact ? exact[1] : any[2];
+  const headline = /^## (.+?)(?: <a |$)/m.exec(body)?.[1]?.trim() ?? null;
+  return { verdict, headline };
+}
+
+function summaryFor(repo, pr, app, sha, anyHead = false) {
   const comments = JSON.parse(gh(["api", "--paginate", "--slurp", `repos/${repo}/issues/${pr}/comments`])).flat();
-  const markerRe = new RegExp(`<!-- ${app.marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} [^>]*head=${sha} verdict=(\\w+) -->`);
   for (const comment of comments.reverse()) {
-    if (comment.user?.login !== app.bot) continue;
-    const match = markerRe.exec(comment.body ?? "");
-    if (!match) continue;
-    const headline = /^## (.+?)(?: <a |$)/m.exec(comment.body)?.[1]?.trim() ?? null;
-    return { verdict: match[1], headline };
+    const summary = summaryFromComment(comment, app, sha, anyHead);
+    if (summary) return summary;
   }
   return null;
 }
@@ -172,7 +218,9 @@ function completedCheck(repo, sha, app) {
 
 function prCommitShas(repo, pr) {
   // Newest first, so the latest reviewed commit wins.
-  return JSON.parse(gh(["pr", "view", String(pr), "--repo", repo, "--json", "commits", "--jq", "[.commits[].oid]"])).reverse();
+  return JSON.parse(
+    gh(["pr", "view", String(pr), "--repo", repo, "--json", "commits", "--jq", "[.commits[].oid]"]),
+  ).reverse();
 }
 
 // The reviewed sha and its conclusion, or null. With anyHead, any commit of the PR counts.
@@ -205,10 +253,10 @@ function reviewViaGh(repo, pr, options) {
   }
   const { sha, conclusion } = done;
   // The summary comment lands right after the check completes; give it a few polls.
-  let summary = summaryFor(repo, pr, app, sha);
+  let summary = summaryFor(repo, pr, app, sha, options.anyHead);
   for (let attempt = 0; !summary && attempt < 6; attempt += 1) {
     sleep(10);
-    summary = summaryFor(repo, pr, app, sha);
+    summary = summaryFor(repo, pr, app, sha, options.anyHead);
   }
   const findings = unresolvedThreads(repo, pr, app.bot);
   const headline = summary?.headline ?? null;
@@ -227,7 +275,10 @@ function reviewViaGh(repo, pr, options) {
 
 function reviewViaCli(repo, pr, app) {
   const url = `https://github.com/${repo}/pull/${pr}`;
-  const result = spawnSync("arcanist", ["review", url, "--wait", "--json"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  const result = spawnSync("arcanist", ["review", url, "--wait", "--json"], {
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
   if (result.error) usage(`arcanist failed to start: ${result.error.message}`);
   let payload;
   try {
@@ -242,7 +293,9 @@ function reviewViaCli(repo, pr, app) {
   // Thread ids come from GitHub so the loop can resolve them after a fix.
   const threads = unresolvedThreads(repo, pr, app.bot);
   const threadFor = (finding) =>
-    threads.find((thread) => thread.file === finding.file && (thread.line === finding.line || thread.title === finding.title))?.threadId ?? null;
+    threads.find(
+      (thread) => thread.file === finding.file && (thread.line === finding.line || thread.title === finding.title),
+    )?.threadId ?? null;
   return {
     backend: "cli",
     repo,
@@ -263,12 +316,17 @@ function reviewViaCli(repo, pr, app) {
   };
 }
 
-const options = parseArgs(process.argv.slice(2));
-const { repo, pr } = resolvePr(options.pr, options.repo);
-const backend = options.backend === "auto" ? (options.app === "arcanist" && cliAvailable() ? "cli" : "gh") : options.backend;
-if (backend === "cli" && options.app === "arcanist-qa" && !/\/\/qa\./.test(process.env.ARCANIST_API_URL ?? "")) {
-  usage("--app arcanist-qa with the cli backend needs ARCANIST_API_URL set to the QA host (and a QA ARCANIST_TOKEN)");
+export { summaryFromComment };
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const options = parseArgs(process.argv.slice(2));
+  const { repo, pr } = resolvePr(options.pr, options.repo);
+  const backend =
+    options.backend === "auto" ? (options.app === "arcanist" && cliAvailable() ? "cli" : "gh") : options.backend;
+  if (backend === "cli" && options.app === "arcanist-qa" && !/\/\/qa\./.test(process.env.ARCANIST_API_URL ?? "")) {
+    usage("--app arcanist-qa with the cli backend needs ARCANIST_API_URL set to the QA host (and a QA ARCANIST_TOKEN)");
+  }
+  const result = backend === "cli" ? reviewViaCli(repo, pr, APPS[options.app]) : reviewViaGh(repo, pr, options);
+  process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+  process.exitCode = result.blocking ? 1 : 0;
 }
-const result = backend === "cli" ? reviewViaCli(repo, pr, APPS[options.app]) : reviewViaGh(repo, pr, options);
-process.stdout.write(JSON.stringify(result, null, 2) + "\n");
-process.exitCode = result.blocking ? 1 : 0;
