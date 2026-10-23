@@ -11,8 +11,8 @@
 // Exit codes: 0 no blocking finding, 1 blocking finding, 2 usage or tool error, 3 timeout.
 //
 // --no-trigger  wait for a review that is already running instead of asking for one.
-// --any-head    accept a completed review on an earlier commit of the PR (Arcanist reviews a PR
-//               on open and does not re-review every push); the result names the reviewed head.
+// --any-head    accept the latest published review on an earlier commit of the PR (Arcanist reviews
+//               a PR on open and does not re-review every push); the result names the reviewed head.
 // --app arcanist-qa targets Arcanist's QA deployment. With the cli backend that needs
 //               ARCANIST_API_URL pointing at the QA host and a matching ARCANIST_TOKEN.
 
@@ -199,8 +199,9 @@ function summaryFromComment(comment, app, sha, anyHead) {
   const match = exact ?? any;
   if (!match) return null;
   const verdict = exact ? exact[1] : any[2];
+  const head = exact ? sha : any[1];
   const headline = /^## (.+?)(?: <a |$)/m.exec(body)?.[1]?.trim() ?? null;
-  return { verdict, headline };
+  return { verdict, headline, head };
 }
 
 function summaryFor(repo, pr, app, sha, anyHead = false) {
@@ -222,21 +223,16 @@ function completedCheck(repo, sha, app) {
   return out.length > 0 ? out.split("\n")[0] : null;
 }
 
-function prCommitShas(repo, pr) {
-  // Newest first, so the latest reviewed commit wins.
-  return JSON.parse(
-    gh(["pr", "view", String(pr), "--repo", repo, "--json", "commits", "--jq", "[.commits[].oid]"]),
-  ).reverse();
-}
-
-// The reviewed sha and its conclusion, or null. With anyHead, any commit of the PR counts.
+// The reviewed sha and its conclusion, or null. With anyHead and no check on the current head, the
+// head named in the latest summary comment wins: it survives a rebase, and a stack parent's own
+// check on an ancestor commit never stands in for this PR's review.
 function findCompleted(repo, pr, head, app, anyHead) {
-  const candidates = anyHead ? [head, ...prCommitShas(repo, pr).filter((sha) => sha !== head)] : [head];
-  for (const sha of candidates) {
-    const conclusion = completedCheck(repo, sha, app);
-    if (conclusion) return { sha, conclusion };
-  }
-  return null;
+  const conclusion = completedCheck(repo, head, app);
+  if (conclusion) return { sha: head, conclusion };
+  if (!anyHead) return null;
+  const published = summaryFor(repo, pr, app, head, true);
+  if (!published) return null;
+  return { sha: published.head, conclusion: completedCheck(repo, published.head, app) ?? "published" };
 }
 
 function reviewViaGh(repo, pr, options) {
@@ -279,19 +275,32 @@ function reviewViaGh(repo, pr, options) {
   };
 }
 
-function reviewViaCli(repo, pr, app) {
+function parseJson(text) {
+  try {
+    return JSON.parse(text ?? "");
+  } catch {
+    return null;
+  }
+}
+
+function reviewViaCli(repo, pr, options) {
+  const app = APPS[options.app];
   const url = `https://github.com/${repo}/pull/${pr}`;
   const result = spawnSync("arcanist", ["review", url, "--wait", "--json"], {
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
   });
   if (result.error) usage(`arcanist failed to start: ${result.error.message}`);
-  let payload;
-  try {
-    payload = JSON.parse(result.stdout);
-  } catch {
+  // The CLI prints a result on stdout and an {error} object on stderr.
+  const payload = [result.stdout, result.stderr].map(parseJson).find(Boolean);
+  if (!payload) {
     process.stderr.write(result.stderr ?? "");
     usage(`arcanist review exited ${result.status} without JSON`);
+  }
+  if (payload.error?.code === "conflict") {
+    // A review for this head is already running or was replaced by a newer one: wait on it, never re-trigger.
+    process.stderr.write(`arcanist review: ${payload.error.message}; waiting on the running review via gh\n`);
+    return reviewViaGh(repo, pr, { ...options, trigger: false });
   }
   if (payload.error) usage(`arcanist review: ${payload.error.message ?? JSON.stringify(payload.error)}`);
   const findings = payload.findings ?? [];
@@ -335,7 +344,7 @@ if (runAsScript) {
   if (backend === "cli" && options.app === "arcanist-qa" && !/\/\/qa\./.test(process.env.ARCANIST_API_URL ?? "")) {
     usage("--app arcanist-qa with the cli backend needs ARCANIST_API_URL set to the QA host (and a QA ARCANIST_TOKEN)");
   }
-  const result = backend === "cli" ? reviewViaCli(repo, pr, APPS[options.app]) : reviewViaGh(repo, pr, options);
+  const result = backend === "cli" ? reviewViaCli(repo, pr, options) : reviewViaGh(repo, pr, options);
   process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   process.exitCode = result.blocking ? 1 : 0;
 }
