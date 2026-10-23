@@ -17,7 +17,8 @@
 //               ARCANIST_API_URL pointing at the QA host and a matching ARCANIST_TOKEN.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { existsSync, realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const APPS = {
   // REST reports the bot as "arcanist[bot]"; GraphQL reports it as "arcanist". `botLogin` matches both.
@@ -36,11 +37,12 @@ const APPS = {
 };
 const HOLD_HEADLINE = "Hold off on merging";
 
+const USAGE =
+  "usage: zeus-review.mjs [<pr-url|number>] [--repo owner/repo] [--backend auto|cli|gh] [--app arcanist|arcanist-qa] [--timeout seconds] [--interval seconds] [--no-trigger] [--any-head]\n";
+
 function usage(message) {
   if (message) process.stderr.write(`error: ${message}\n`);
-  process.stderr.write(
-    "usage: zeus-review.mjs [<pr-url|number>] [--repo owner/repo] [--backend auto|cli|gh] [--app arcanist|arcanist-qa] [--timeout seconds] [--interval seconds] [--no-trigger] [--any-head]\n",
-  );
+  process.stderr.write(USAGE);
   process.exit(2);
 }
 
@@ -49,6 +51,10 @@ function parseArgs(argv) {
   const positional = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
+    if (arg === "--help" || arg === "-h") {
+      process.stdout.write(USAGE);
+      process.exit(0);
+    }
     if (arg === "--repo") out.repo = argv[(i += 1)];
     else if (arg === "--backend") out.backend = argv[(i += 1)];
     else if (arg === "--app") out.app = argv[(i += 1)];
@@ -318,7 +324,10 @@ function reviewViaCli(repo, pr, app) {
 
 export { summaryFromComment };
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// argv[1] keeps a symlinked path while import.meta.url is the real file, so compare real paths.
+const runAsScript =
+  process.argv[1] && existsSync(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+if (runAsScript) {
   const options = parseArgs(process.argv.slice(2));
   const { repo, pr } = resolvePr(options.pr, options.repo);
   const backend =
