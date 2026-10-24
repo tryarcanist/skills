@@ -15,7 +15,27 @@ node <skill-dir>/scripts/zeus-review.mjs <pr-url|pr-number> [--repo owner/repo] 
 
 Exit 0 means no blocking finding, 1 means a blocking finding, 2 a tool error, 3 a timeout (30 min default). The JSON carries `headSha` (the reviewed commit), `headline`, `blocking`, and `findings[]` with `file`, `line`, `title`, `body`, `blocksMerge`, `threadId`.
 
-Two flags change what "one review" means. `--no-trigger` waits for a review that is already running instead of asking for one: use it right after opening a PR, since Arcanist reviews every new PR on its own. `--any-head` accepts a completed review on an earlier commit of the PR, because Arcanist does not re-review every push; the result's `headSha` says which commit it read.
+Two flags change what "one review" means. `--no-trigger` waits for a review that is already running instead of asking for one: use it right after opening a PR, since Arcanist reviews every new PR on its own. `--any-head` accepts a completed review on an earlier commit of the PR, because a workspace can turn off `Review each push of new commits`; the result's `headSha` says which commit it read. With the trigger on, the script asks for a review only when the head has no `Arcanist review` check yet. A queued or running review is waited on, never requested twice.
+
+## When to ask for a review
+
+Arcanist reviews a new PR on its own. Whether it reviews later pushes is the workspace switch `Review each push of new commits`. The loop does not rely on that switch: before each push, decide whether the new head needs a review, and ask only then. A review costs a full lap of model time, so fold every fix of a lap into one push and ask once, after it.
+
+Ask for a review when the push can change the verdict:
+
+- it fixes a blocking finding (every lap of this loop)
+- it changes runtime code, a schema or migration, a prompt, a dependency, or a config value that ships
+- it resolved a merge conflict by hand
+- it weakens or deletes a test assertion
+
+Skip the review when the push leaves the reviewed behavior in place:
+
+- a test, typecheck, lint, or format fix for a red check, with no runtime change
+- comments, docs, the PR body, or a commit message
+- a rebase or restack with the same tree
+- a change the last review itself asked for under a `Ready to merge` headline
+
+A skipped push merges on the last verdict. The report names both commits, the reviewed head and the merged head, with the one-line reason for the skip.
 
 ## Loop
 
@@ -33,9 +53,9 @@ One writer per branch. While the loop runs, nothing else may push to the PR bran
 
    Reply and resolve through `gh`: `gh api graphql -f query='mutation { addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:"<threadId>", body:"<text>"}) { comment { id } } }'` then `resolveReviewThread`. A finding with `threadId: null` has no thread; note it in the PR body instead.
 4. **Repeat guard.** A finding whose title and file already sit in the ledger as fixed in an earlier lap: stop. Report that finding, your earlier fix commit, and Arcanist's new text. Someone must look.
-5. **Commit and push** the fixes to the PR's head branch, one commit per lap, message `Fix Arcanist review findings (lap N)`. Then go to step 1. The new head starts a new review.
+5. **Commit and push** the fixes to the PR's head branch, one commit per lap, message `Fix Arcanist review findings (lap N)`. Then go to step 1: a fix for a blocking finding always gets a review, and the script asks for one when the workspace did not start it on the push.
 6. **Out of laps.** Report what is still open with file and line, and the last headline.
 
 ## Report
 
-End with: final headline, head SHA, laps used, findings fixed (count and titles), findings declined (titles and reasons), anything left open.
+End with: final headline, reviewed head SHA (and the merged head with the skip reason when they differ), laps used, findings fixed (count and titles), findings declined (titles and reasons), anything left open.
