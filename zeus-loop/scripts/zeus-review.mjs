@@ -11,8 +11,10 @@
 // Exit codes: 0 no blocking finding, 1 blocking finding, 2 usage or tool error, 3 timeout.
 //
 // --no-trigger  wait for a review that is already running instead of asking for one.
-// --any-head    accept the latest published review on an earlier commit of the PR (Arcanist reviews
-//               a PR on open and does not re-review every push); the result names the reviewed head.
+// --any-head    accept the latest published review on an earlier commit of the PR (a workspace can
+//               turn off "Review each push of new commits"); the result names the reviewed head.
+// With the trigger on, the mention is posted only when the head has no "Arcanist review" check yet;
+// a queued or running review is waited on, never requested twice.
 // --app arcanist-qa targets Arcanist's QA deployment. With the cli backend that needs
 //               ARCANIST_API_URL pointing at the QA host and a matching ARCANIST_TOKEN.
 
@@ -213,6 +215,17 @@ function summaryFor(repo, pr, app, sha, anyHead = false) {
   return null;
 }
 
+// True when any check with the app's name exists on the sha: a review is queued, running, or done.
+function checkExists(repo, sha, app) {
+  const out = gh([
+    "api",
+    `repos/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(app.check)}&per_page=100`,
+    "--jq",
+    `[.check_runs[] | select(.name=="${app.check}")] | length`,
+  ]).trim();
+  return Number(out) > 0;
+}
+
 function completedCheck(repo, sha, app) {
   const out = gh([
     "api",
@@ -241,8 +254,12 @@ function reviewViaGh(repo, pr, options) {
   const deadline = Date.now() + options.timeout * 1000;
   let done = findCompleted(repo, pr, head, app, options.anyHead);
   if (!done && options.trigger) {
-    gh(["pr", "comment", String(pr), "--repo", repo, "--body", app.mention]);
-    process.stderr.write(`posted "${app.mention}" on ${repo}#${pr} head ${head.slice(0, 7)}\n`);
+    if (checkExists(repo, head, app)) {
+      process.stderr.write(`a "${app.check}" check already exists on ${head.slice(0, 7)}; waiting on it\n`);
+    } else {
+      gh(["pr", "comment", String(pr), "--repo", repo, "--body", app.mention]);
+      process.stderr.write(`posted "${app.mention}" on ${repo}#${pr} head ${head.slice(0, 7)}\n`);
+    }
   }
   while (!done) {
     if (Date.now() > deadline) {
