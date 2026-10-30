@@ -15,8 +15,6 @@
 //               turn off "Review each push of new commits"); the result names the reviewed head.
 // With the trigger on, the mention is posted only when the head has no "Arcanist review" check yet;
 // a queued or running review is waited on, never requested twice.
-// --app arcanist-qa targets Arcanist's QA deployment. With the cli backend that needs
-//               ARCANIST_API_URL pointing at the QA host and a matching ARCANIST_TOKEN.
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
@@ -30,6 +28,7 @@ const APPS = {
     marker: "arcanist-zeus:v1",
     mention: "@tryarcanist /review",
   },
+  // Arcanist's own staging reviewer, used on Arcanist repos only. Not documented for customers.
   "arcanist-qa": {
     bot: "arcanist-qa[bot]",
     check: "Arcanist review (qa)",
@@ -40,7 +39,7 @@ const APPS = {
 const HOLD_HEADLINE = "Hold off on merging";
 
 const USAGE =
-  "usage: zeus-review.mjs [<pr-url|number>] [--repo owner/repo] [--backend auto|cli|gh] [--app arcanist|arcanist-qa] [--timeout seconds] [--interval seconds] [--no-trigger] [--any-head]\n";
+  "usage: zeus-review.mjs [<pr-url|number>] [--repo owner/repo] [--backend auto|cli|gh] [--timeout seconds] [--interval seconds] [--no-trigger] [--any-head]\n";
 
 function usage(message) {
   if (message) process.stderr.write(`error: ${message}\n`);
@@ -68,7 +67,7 @@ function parseArgs(argv) {
     else positional.push(arg);
   }
   if (!["auto", "cli", "gh"].includes(out.backend)) usage("--backend must be auto, cli, or gh");
-  if (!APPS[out.app]) usage("--app must be arcanist or arcanist-qa");
+  if (!APPS[out.app]) usage("--app must be arcanist");
   if (!Number.isFinite(out.timeout) || out.timeout <= 0) usage("--timeout must be a positive number");
   if (!Number.isFinite(out.interval) || out.interval <= 0) usage("--interval must be a positive number");
   out.pr = positional[0];
