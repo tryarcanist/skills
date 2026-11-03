@@ -25,14 +25,13 @@ Ask for a review when the push can change the verdict:
 
 - it fixes a blocking finding (every lap of this loop)
 - it changes runtime code, a schema or migration, a prompt, a dependency, or a config value that ships
-- it resolved a merge conflict by hand
 - it weakens or deletes a test assertion
 
 Skip the review when the push leaves the reviewed behavior in place:
 
 - a test, typecheck, lint, or format fix for a red check, with no runtime change
 - comments, docs, the PR body, or a commit message
-- a rebase or restack with the same tree
+- a rebase or restack, including one that resolved a conflict by hand, when the PR's own diff against its base keeps the reviewed change
 - a change the last review itself asked for under a `Ready to merge` headline
 
 A skipped push merges on the last verdict. The report names both commits, the reviewed head and the merged head, with the one-line reason for the skip.
