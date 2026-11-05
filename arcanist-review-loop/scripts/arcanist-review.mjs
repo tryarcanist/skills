@@ -48,7 +48,7 @@ function resolveApp() {
 const HOLD_HEADLINE = "Hold off on merging";
 
 const USAGE =
-  "usage: zeus-review.mjs [<pr-url|number>] [--repo owner/repo] [--backend auto|cli|gh] [--timeout seconds] [--interval seconds] [--no-trigger] [--any-head]\n";
+  "usage: arcanist-review.mjs [<pr-url|number>] [--repo owner/repo] [--backend auto|cli|gh] [--timeout seconds] [--interval seconds] [--no-trigger] [--any-head]\n";
 
 function usage(message) {
   if (message) process.stderr.write(`error: ${message}\n`);
@@ -128,7 +128,7 @@ function sleep(seconds) {
   execFileSync("sleep", [String(seconds)]);
 }
 
-// Strip the folded "Agent prompt" block Zeus appends: it is presentation, not part of the finding.
+// Strip the folded "Agent prompt" block Arcanist appends: it is presentation, not part of the finding.
 function cleanFindingBody(body) {
   return body
     .replace(/<!--[\s\S]*?-->/g, "")

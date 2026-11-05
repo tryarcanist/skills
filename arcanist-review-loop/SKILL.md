@@ -1,16 +1,16 @@
 ---
-name: zeus-loop
-description: Loop an Arcanist (Zeus) review on a pull request until it says Ready to merge. Use for "zeus loop", "loop Arcanist on this PR", "iterate until Arcanist is clean", or after pushing a PR you want reviewed and fixed before merge. Works with the arcanist CLI or with gh alone.
+name: arcanist-review-loop
+description: Loop an Arcanist review on a pull request until it says Ready to merge. Use for "arcanist review loop", "loop Arcanist on this PR", "iterate until Arcanist is clean", or after pushing a PR you want reviewed and fixed before merge. Works with the arcanist CLI or with gh alone.
 ---
 
-# Zeus loop
+# Arcanist review loop
 
 Review, fix, push, repeat until Arcanist says **Ready to merge** or the lap cap stops you.
 
-The script `zeus-review.mjs` in this skill's `scripts` folder runs one review and prints one JSON object. It picks the backend on its own: the `arcanist` CLI when it is installed and logged in, else `gh` (it comments `@tryarcanist /review`, waits on the `Arcanist review` check, and reads the summary and inline threads). Pass `--backend gh` or `--backend cli` to force one. Needs `node` 22+ and an authenticated `gh`.
+The script `arcanist-review.mjs` in this skill's `scripts` folder runs one review and prints one JSON object. It picks the backend on its own: the `arcanist` CLI when it is installed and logged in, else `gh` (it comments `@tryarcanist /review`, waits on the `Arcanist review` check, and reads the summary and inline threads). Pass `--backend gh` or `--backend cli` to force one. Needs `node` 22+ and an authenticated `gh`.
 
 ```bash
-node <skill-dir>/scripts/zeus-review.mjs <pr-url|pr-number> [--repo owner/repo]
+node <skill-dir>/scripts/arcanist-review.mjs <pr-url|pr-number> [--repo owner/repo]
 ```
 
 Exit 0 means no blocking finding, 1 means a blocking finding, 2 a tool error, 3 a timeout (30 min default). The JSON carries `headSha` (the reviewed commit), `headline`, `blocking`, and `findings[]` with `file`, `line`, `title`, `body`, `blocksMerge`, `threadId`.
