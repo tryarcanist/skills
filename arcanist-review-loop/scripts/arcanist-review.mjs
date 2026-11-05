@@ -26,7 +26,7 @@ import { fileURLToPath } from "node:url";
 const DEFAULT_APP = {
   bot: "arcanist[bot]",
   check: "Arcanist review",
-  marker: "arcanist-zeus:v1",
+  marker: "arcanist-review:v1",
   mention: "@tryarcanist /review",
 };
 const APP_FIELDS = Object.keys(DEFAULT_APP);
