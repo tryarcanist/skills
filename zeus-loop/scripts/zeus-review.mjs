@@ -15,27 +15,36 @@
 //               turn off "Review each push of new commits"); the result names the reviewed head.
 // With the trigger on, the mention is posted only when the head has no "Arcanist review" check yet;
 // a queued or running review is waited on, never requested twice.
+// ARCANIST_REVIEW_APP  JSON for another Arcanist deployment's GitHub App: {"bot","check","marker","mention"}.
+//               With the cli backend that needs ARCANIST_API_URL and ARCANIST_TOKEN for that deployment.
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const APPS = {
-  // REST reports the bot as "arcanist[bot]"; GraphQL reports it as "arcanist". `botLogin` matches both.
-  arcanist: {
-    bot: "arcanist[bot]",
-    check: "Arcanist review",
-    marker: "arcanist-zeus:v1",
-    mention: "@tryarcanist /review",
-  },
-  // Arcanist's own staging reviewer, used on Arcanist repos only. Not documented for customers.
-  "arcanist-qa": {
-    bot: "arcanist-qa[bot]",
-    check: "Arcanist review (qa)",
-    marker: "arcanist-zeus-qa:v1",
-    mention: "@arcanist-qa /review",
-  },
+// REST reports the bot as "arcanist[bot]"; GraphQL reports it as "arcanist". `botLogin` matches both.
+const DEFAULT_APP = {
+  bot: "arcanist[bot]",
+  check: "Arcanist review",
+  marker: "arcanist-zeus:v1",
+  mention: "@tryarcanist /review",
 };
+const APP_FIELDS = Object.keys(DEFAULT_APP);
+
+function resolveApp() {
+  const raw = process.env.ARCANIST_REVIEW_APP?.trim();
+  if (!raw) return DEFAULT_APP;
+  let app;
+  try {
+    app = JSON.parse(raw);
+  } catch {
+    usage("ARCANIST_REVIEW_APP must be JSON");
+  }
+  for (const field of APP_FIELDS) {
+    if (typeof app?.[field] !== "string" || app[field].trim() === "") usage(`ARCANIST_REVIEW_APP needs a ${field} string`);
+  }
+  return app;
+}
 const HOLD_HEADLINE = "Hold off on merging";
 
 const USAGE =
@@ -48,7 +57,7 @@ function usage(message) {
 }
 
 function parseArgs(argv) {
-  const out = { backend: "auto", app: "arcanist", timeout: 1800, interval: 30, trigger: true, anyHead: false };
+  const out = { backend: "auto", app: resolveApp(), timeout: 1800, interval: 30, trigger: true, anyHead: false };
   const positional = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -58,7 +67,6 @@ function parseArgs(argv) {
     }
     if (arg === "--repo") out.repo = argv[(i += 1)];
     else if (arg === "--backend") out.backend = argv[(i += 1)];
-    else if (arg === "--app") out.app = argv[(i += 1)];
     else if (arg === "--timeout") out.timeout = Number(argv[(i += 1)]);
     else if (arg === "--interval") out.interval = Number(argv[(i += 1)]);
     else if (arg === "--no-trigger") out.trigger = false;
@@ -67,7 +75,6 @@ function parseArgs(argv) {
     else positional.push(arg);
   }
   if (!["auto", "cli", "gh"].includes(out.backend)) usage("--backend must be auto, cli, or gh");
-  if (!APPS[out.app]) usage("--app must be arcanist");
   if (!Number.isFinite(out.timeout) || out.timeout <= 0) usage("--timeout must be a positive number");
   if (!Number.isFinite(out.interval) || out.interval <= 0) usage("--interval must be a positive number");
   out.pr = positional[0];
@@ -248,7 +255,7 @@ function findCompleted(repo, pr, head, app, anyHead) {
 }
 
 function reviewViaGh(repo, pr, options) {
-  const app = APPS[options.app];
+  const app = options.app;
   const head = headSha(repo, pr);
   const deadline = Date.now() + options.timeout * 1000;
   let done = findCompleted(repo, pr, head, app, options.anyHead);
@@ -300,7 +307,7 @@ function parseJson(text) {
 }
 
 function reviewViaCli(repo, pr, options) {
-  const app = APPS[options.app];
+  const app = options.app;
   const url = `https://github.com/${repo}/pull/${pr}`;
   const result = spawnSync("arcanist", ["review", url, "--wait", "--json"], {
     encoding: "utf8",
@@ -356,9 +363,9 @@ if (runAsScript) {
   const options = parseArgs(process.argv.slice(2));
   const { repo, pr } = resolvePr(options.pr, options.repo);
   const backend =
-    options.backend === "auto" ? (options.app === "arcanist" && cliAvailable() ? "cli" : "gh") : options.backend;
-  if (backend === "cli" && options.app === "arcanist-qa" && !/\/\/qa\./.test(process.env.ARCANIST_API_URL ?? "")) {
-    usage("--app arcanist-qa with the cli backend needs ARCANIST_API_URL set to the QA host (and a QA ARCANIST_TOKEN)");
+    options.backend === "auto" ? (options.app === DEFAULT_APP && cliAvailable() ? "cli" : "gh") : options.backend;
+  if (backend === "cli" && options.app !== DEFAULT_APP && !process.env.ARCANIST_API_URL) {
+    usage("ARCANIST_REVIEW_APP with the cli backend needs ARCANIST_API_URL (and ARCANIST_TOKEN) for that deployment");
   }
   const result = backend === "cli" ? reviewViaCli(repo, pr, options) : reviewViaGh(repo, pr, options);
   process.stdout.write(JSON.stringify(result, null, 2) + "\n");
