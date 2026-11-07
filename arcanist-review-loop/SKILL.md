@@ -29,7 +29,7 @@ Ask for a review when the push can change the verdict:
 
 Skip the review when the push leaves the reviewed behavior in place:
 
-- a test, typecheck, lint, or format fix for a red check, with no runtime change
+- a test, typecheck, lint, or format fix for a red check, with no runtime change, including a migration file renamed to a newer timestamp with its SQL unchanged
 - comments, docs, the PR body, or a commit message
 - a rebase or restack, including one that resolved a conflict by hand, when the PR's own diff against its base keeps the reviewed change
 - a change the last review itself asked for under a `Ready to merge` headline
