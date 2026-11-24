@@ -46,6 +46,34 @@ function resolveApp() {
   return app;
 }
 const HOLD_HEADLINE = "Hold off on merging";
+const READY_HEADLINE = "Ready to merge";
+
+function mergeTierMarker(reviewMarker) {
+  const match = /^arcanist-review(-[a-z]+)?:v\d+$/.exec(reviewMarker);
+  if (!match) return null;
+  return `arcanist-review-merge-tier${match[1] ?? ""}:v1`;
+}
+
+function readMergeTier(body, reviewMarker, head) {
+  const name = mergeTierMarker(reviewMarker);
+  if (!name) return null;
+  const marker = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`<!-- ${marker} head=${head} tier=(\\w+) -->`).exec(body);
+  if (match?.[1] === "merge" || match?.[1] === "merge_with_follow_ups" || match?.[1] === "do_not_merge") return match[1];
+  return null;
+}
+
+function blocksMerge(tier, headline, conclusion) {
+  if (tier === "do_not_merge") return true;
+  if (tier === "merge" || tier === "merge_with_follow_ups") return false;
+  return headline === HOLD_HEADLINE || (headline === null && conclusion === "action_required");
+}
+
+function headlineFor(tier, heading) {
+  if (tier === "do_not_merge") return HOLD_HEADLINE;
+  if (tier === "merge" || tier === "merge_with_follow_ups") return READY_HEADLINE;
+  return heading;
+}
 
 const USAGE =
   "usage: arcanist-review.mjs [<pr-url|number>] [--repo owner/repo] [--backend auto|cli|gh] [--timeout seconds] [--interval seconds] [--no-trigger] [--any-head]\n";
@@ -208,8 +236,9 @@ function summaryFromComment(comment, app, sha, anyHead) {
   if (!match) return null;
   const verdict = exact ? exact[1] : any[2];
   const head = exact ? sha : any[1];
-  const headline = /^## (.+?)(?: <a |$)/m.exec(body)?.[1]?.trim() ?? null;
-  return { verdict, headline, head };
+  const tier = readMergeTier(body, app.marker, head);
+  const heading = /^## (.+?)(?: <a |$)/m.exec(body)?.[1]?.trim() ?? null;
+  return { verdict, headline: headlineFor(tier, heading), head, tier };
 }
 
 function summaryFor(repo, pr, app, sha, anyHead = false) {
@@ -285,7 +314,7 @@ function reviewViaGh(repo, pr, options) {
   }
   const findings = unresolvedThreads(repo, pr, app.bot);
   const headline = summary?.headline ?? null;
-  const blocking = headline === HOLD_HEADLINE || (headline === null && conclusion === "action_required");
+  const blocking = blocksMerge(summary?.tier ?? null, headline, conclusion);
   return {
     backend: "gh",
     repo,
@@ -340,7 +369,7 @@ function reviewViaCli(repo, pr, options) {
     pr,
     headSha: payload.headSha ?? headSha(repo, pr),
     verdict: payload.verdict ?? "unknown",
-    headline: blocking ? HOLD_HEADLINE : "Ready to merge",
+    headline: blocking ? HOLD_HEADLINE : READY_HEADLINE,
     blocking,
     findings: findings.map((finding) => ({
       file: finding.file,
@@ -354,7 +383,7 @@ function reviewViaCli(repo, pr, options) {
   };
 }
 
-export { summaryFromComment };
+export { blocksMerge, summaryFromComment };
 
 // argv[1] keeps a symlinked path while import.meta.url is the real file, so compare real paths.
 const runAsScript =
