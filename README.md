@@ -24,6 +24,10 @@ The command installs into both `.agents/skills/audit-code-reviewers` and `.claud
 
 The JSON response includes `auditStatus: "not_started"` and `nextAction`. The agent reads `nextAction.path` and follows the skill to complete the audit. The CLI installs the skill; the coding agent performs the analysis.
 
+The audit discovers review comments, summaries, and review-named GitHub checks. Check-based identities use `app:<github-app-slug>`, such as `app:graphite-app`. The discovery output also lists `checkSurfaces`; select an unfamiliar reviewer explicitly with `--only app:<slug>` even when its check has an unusual name. Use the roster's aliases when a single reviewer publishes through both a bot account and an app check.
+
+The collector retains check summaries, annotations, and every attempt at each known historical commit. A successful check alone does not prove a completed code review. Skipped, pending, failed, and unrecognized outputs remain explicit; they do not grant reviewed-commit coverage. A failed collection stops or marks the corpus incomplete. A selected check app with no measurable review stays `not_measurable`.
+
 Try the synthetic report without GitHub access or model calls:
 
 ```bash

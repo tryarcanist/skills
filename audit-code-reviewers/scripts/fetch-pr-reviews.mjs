@@ -6,6 +6,12 @@
 
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
+import {
+  checkIdentity,
+  isReviewerCheck,
+  checkEvidence,
+  checkPages,
+} from "./lib/reviewer-checks.mjs";
 
 const GH_ATTEMPTS = 3;
 const RETRY_DELAYS_MS = [2000, 4000, 8000];
@@ -335,7 +341,7 @@ function runGh(ghArgs, { maxBuffer = 128 * 1024 * 1024 } = {}) {
 // gh --paginate --slurp returns one array per page; flatten. No text rewriting,
 // so bracket sequences inside comment bodies (mock.calls[0][0], markdown refs)
 // survive untouched.
-function ghJson(path, { tolerate = false } = {}) {
+function ghJson(path, { tolerate = false, strict = false } = {}) {
   let raw;
   try {
     raw = runGh(["api", path, "--paginate", "--slurp"]);
@@ -351,11 +357,17 @@ function ghJson(path, { tolerate = false } = {}) {
     process.exit(1);
   }
   raw = raw.trim();
-  if (!raw) return [];
+  if (!raw) {
+    if (strict) throw new Error(`Empty response for ${path}`);
+    return [];
+  }
   try {
     const pages = JSON.parse(raw);
+    if (strict && !Array.isArray(pages))
+      throw new Error("Expected paginated response");
     return Array.isArray(pages) ? pages.flat() : [];
   } catch {
+    if (strict) throw new Error(`could not parse gh output for ${path}`);
     warn(`could not parse gh output for ${path}; treated as empty`);
     return [];
   }
@@ -719,6 +731,88 @@ for (const finding of findingInstances) {
     body: "",
   });
 }
+// Fetch every known historical head, including heads recovered from review pins.
+const checkRuns = [];
+const checkShas = [
+  ...new Set(
+    [
+      ...commits.map((c) => c.sha),
+      pr.head,
+      ...reviewEvents.map((e) => e.reviewedCommit),
+    ].filter(Boolean),
+  ),
+];
+for (const sha of only.length && !only.some((id) => id.startsWith("app:"))
+  ? []
+  : checkShas) {
+  const checks = checkPages(
+    ghJson(
+      `repos/${args.repo}/commits/${sha}/check-runs?filter=all&per_page=100`,
+      { strict: true },
+    ),
+  );
+  for (const check of checks.filter((c) => isReviewerCheck(c, only))) {
+    if (!check.id || !check.html_url)
+      throw new Error("Check publication identity is missing");
+    if (check.head_sha !== sha)
+      throw new Error(`Check ${check.id} has an unexpected commit`);
+    const annotations =
+      check.output?.annotations_count > 0
+        ? ghJson(
+            `repos/${args.repo}/check-runs/${check.id}/annotations?per_page=100`,
+            { strict: true },
+          )
+        : [];
+    if (annotations.length !== (check.output?.annotations_count ?? 0))
+      throw new Error(`Check ${check.id}: annotation collection is incomplete`);
+    const evidence = checkEvidence(check, annotations);
+    const reviewer = checkIdentity(check);
+    checkRuns.push({
+      ...check,
+      annotations,
+      reviewState: evidence.reviewState,
+    });
+    if (evidence.reviewState !== "reviewed")
+      warn(
+        `check ${check.id} (${reviewer}): ${evidence.reviewState}; no reviewed-commit coverage granted`,
+      );
+    const id = `check-${check.id}`;
+    reviewEvents.push({
+      id,
+      kind: "check",
+      reviewer,
+      reviewedCommit: evidence.reviewState === "reviewed" ? sha : null,
+      checkHeadSha: sha,
+      reviewedCommitSource:
+        evidence.reviewState === "reviewed" ? "native_check" : null,
+      submittedAt: check.completed_at || check.started_at || null,
+      url: check.html_url,
+      body:
+        evidence.body ||
+        `Check ${check.status}: ${check.conclusion || "pending"}`,
+      verdict: evidence.verdict,
+      reviewState: evidence.reviewState,
+    });
+    for (const [index, annotation] of annotations.entries()) {
+      findingInstances.push({
+        id: `${id}-annotation-${index}`,
+        kind: "annotation",
+        reviewer,
+        reviewEventId: id,
+        reviewedCommit: evidence.reviewState === "reviewed" ? sha : null,
+        path: annotation.path,
+        line: annotation.start_line,
+        startLine: annotation.start_line,
+        endLine: annotation.end_line,
+        url: check.html_url,
+        createdAt: check.completed_at,
+        body: [annotation.title, annotation.message, annotation.raw_details]
+          .filter(Boolean)
+          .join("\n\n"),
+      });
+    }
+  }
+}
 reviewEvents.sort((a, b) =>
   String(a.submittedAt).localeCompare(String(b.submittedAt)),
 );
@@ -835,6 +929,7 @@ const out = {
   },
   commits,
   reviewEvents,
+  checkRuns,
   findingInstances,
   summaryComments,
   humanReplies,

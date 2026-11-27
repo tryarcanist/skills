@@ -286,7 +286,7 @@ try {
           reviewersByCommit: raw.reviewersByCommit,
           reviewEvents: (raw.reviewEvents || []).map(({ body, ...event }) => ({
             ...event,
-            verdict: "unknown",
+            verdict: event.verdict || "unknown",
           })),
           coldReview: {
             state: "not_measurable",
@@ -298,6 +298,24 @@ try {
         },
         true,
       );
+    }
+    // A selected check app with no proven review cannot look like a zero-catch reviewer.
+    for (const reviewer of manifest.reviewers) {
+      if (
+        reviewer.state !== "observed" ||
+        !reviewer.logins.every((login) => login.startsWith("app:"))
+      )
+        continue;
+      const measurable = manifest.selectedPrs.some((n) =>
+        readJson(join(root, `raw/${n}.json`)).reviewEvents.some(
+          (e) => reviewer.logins.includes(e.reviewer) && e.reviewedCommit,
+        ),
+      );
+      if (!measurable) {
+        reviewer.state = "not_measurable";
+        reviewer.reason =
+          "No completed code review with exact-commit evidence was collected. Check outputs and warnings describe pending, failed, skipped, absent or unknown results.";
+      }
     }
     put(join(root, "manifest.json"), manifest, true);
     loadManifest(join(root, "manifest.json"));

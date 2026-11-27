@@ -55,6 +55,11 @@
 
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
+import {
+  checkIdentity,
+  isReviewerCheck,
+  checkPages,
+} from "./lib/reviewer-checks.mjs";
 
 const DEFAULT_MAX_SWEEP = 300;
 const GH_ATTEMPTS = 3;
@@ -587,6 +592,52 @@ for (const [number, byBot] of [...prs.entries()].sort((a, b) => a[0] - b[0])) {
     if (!byBot.has(login)) note(number, login, "summary", r.submitted_at);
   }
 
+  const checkSurfaces = [];
+  if (!only.length || only.some((id) => id.startsWith("app:"))) {
+    const commitRes = ghJson(
+      `repos/${args.repo}/pulls/${number}/commits?per_page=100`,
+    );
+    if (!commitRes.ok || commitRes.items.length >= 250)
+      warn(`could not read complete check commits for PR ${number}`);
+    const checkShas = [
+      ...new Set(
+        [
+          ...commitRes.items.map((c) => c.sha),
+          pr.head,
+          ...revRes.items.map((r) => r.commit_id),
+        ].filter(Boolean),
+      ),
+    ];
+    for (const sha of checkShas) {
+      const res = ghJson(
+        `repos/${args.repo}/commits/${sha}/check-runs?filter=all&per_page=100`,
+      );
+      if (!res.ok) {
+        warn(`could not read checks for PR ${number} at ${sha}`);
+        continue;
+      }
+      let checks;
+      try {
+        checks = checkPages(res.items);
+      } catch {
+        warn(`could not read checks for PR ${number}: malformed response`);
+        continue;
+      }
+      for (const check of checks) {
+        checkSurfaces.push({
+          id: check.id,
+          app: checkIdentity(check),
+          name: check.name,
+          headSha: check.head_sha,
+          status: check.status,
+          conclusion: check.conclusion,
+        });
+        const at = check.completed_at || check.started_at;
+        if (isReviewerCheck(check, [...only]) && inWindow(at))
+          note(number, checkIdentity(check), "summary", at);
+      }
+    }
+  }
   const ready = readyState(number, pr.draft);
   const latencyFrom = ready.readyForReviewAt || pr.created_at;
 
@@ -616,6 +667,7 @@ for (const [number, byBot] of [...prs.entries()].sort((a, b) => a[0] - b[0])) {
     discoveredVia: source.get(number) || "reviews",
     reviewers,
     reviewerCount: reviewers.length,
+    checkSurfaces,
   });
 }
 
@@ -665,7 +717,11 @@ const corpus = {
     maxSweep > 0 &&
     !sweepCapHit &&
     !excluded.some((e) => e.reason === "metadata_unavailable") &&
-    !warnings.some((w) => /sweep stopped|could not read reviews/.test(w)),
+    !warnings.some((w) =>
+      /sweep stopped|could not read reviews|could not read checks|could not read complete check commits/.test(
+        w,
+      ),
+    ),
   totals: {
     prs: meta.length,
     prsWithMultipleReviewers: meta.filter((p) => p.reviewerCount > 1).length,

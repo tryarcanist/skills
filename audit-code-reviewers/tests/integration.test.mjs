@@ -311,10 +311,17 @@ test("known price produces conditional savings and unique coverage at risk", () 
   assert.match(r.report, /conditional/i);
 });
 
-function githubFixture({ summary = "", oldReview = false } = {}) {
+function githubFixture({
+  summary = "",
+  oldReview = false,
+  checks = [],
+  annotations = [],
+} = {}) {
   const f = fixture();
   mkdirSync(join(f.root, "bin"));
   const data = {
+    checks,
+    annotations,
     pr: {
       number: 1,
       title: "Fixture",
@@ -370,6 +377,8 @@ const f = JSON.parse(fs.readFileSync(path.join(__dirname,'../github.json'))); co
 if (p === 'graphql') v={data:{repository:{pullRequest:{reviewThreads:{nodes:[],pageInfo:{hasNextPage:false}}}}}};
 else if (p === 'repos/fixture/repo/pulls/1') v=f.pr;
 else if (p.startsWith('repos/fixture/repo/pulls?')) v=[f.pr];
+else if (p.includes('/check-runs?')) v={check_runs:f.checks.filter(c=>p.includes(c.head_sha))};
+else if (p.includes('/annotations?')) v=f.annotations;
 else if (p.includes('/commits?')) v=f.commits;
 else if (p.includes('/reviews?')) v=f.reviews;
 else if (p.startsWith('repos/fixture/repo/issues/1/comments?')) v=f.comments;
@@ -384,7 +393,7 @@ process.stdout.write(JSON.stringify(a.includes('--slurp')?[v]:v));
     env: { ...process.env, PATH: join(f.root, "bin") + ":" + process.env.PATH },
   };
 }
-function fetch(f) {
+function fetch(f, reviewers = ra) {
   const p = spawnSync(
     process.execPath,
     [
@@ -394,7 +403,7 @@ function fetch(f) {
       "--pr",
       "1",
       "--only",
-      ra,
+      reviewers,
       "--out",
       join(f.root, "fetched.json"),
     ],
@@ -945,4 +954,197 @@ test("a fresh copied installation runs prepare, cold freeze and report offline",
   );
   assert.notEqual(p.status, 0);
   assert.match(p.stderr, /exists/);
+});
+
+function reviewerCheck(overrides = {}) {
+  return {
+    id: 99,
+    name: "AI code review",
+    app: { slug: "fixture-reviewer" },
+    head_sha: A,
+    status: "completed",
+    conclusion: "success",
+    completed_at: "2026-01-02T00:02:00Z",
+    html_url: `${url}/checks?check_run_id=99`,
+    output: {
+      title: "Review",
+      summary: "AI review ran and left 0 comments",
+      text: null,
+      annotations_count: 0,
+    },
+    ...overrides,
+  };
+}
+test("check-only reviews grant exact-commit coverage without a manual import", () => {
+  const r = fetch(
+    githubFixture({ checks: [reviewerCheck()] }),
+    "app:fixture-reviewer",
+  );
+  assert.deepEqual(r.reviewersByCommit, { [A]: ["app:fixture-reviewer"] });
+  assert.equal(r.reviewEvents[0].verdict, "clear");
+  assert.equal(r.checkRuns.length, 1);
+});
+test("skipped, failed and unrecognized checks never grant review coverage", () => {
+  for (const check of [
+    reviewerCheck({ conclusion: "skipped" }),
+    reviewerCheck({
+      conclusion: "failure",
+      output: { summary: "Service failed", annotations_count: 0 },
+    }),
+    reviewerCheck({ output: { summary: "OK", annotations_count: 0 } }),
+    reviewerCheck({
+      output: {
+        summary: "No findings available: request did not run",
+        annotations_count: 0,
+      },
+    }),
+    reviewerCheck({ completed_at: null }),
+  ]) {
+    const r = fetch(githubFixture({ checks: [check] }), "app:fixture-reviewer");
+    assert.deepEqual(r.reviewersByCommit, {});
+    assert.equal(r.checkRuns.length, 1);
+    assert.notEqual(r.checkRuns[0].reviewState, "reviewed");
+  }
+});
+test("check annotations preserve findings and exact code identity", () => {
+  const r = fetch(
+    githubFixture({
+      checks: [
+        reviewerCheck({
+          conclusion: "failure",
+          output: { summary: "1 issue found", annotations_count: 1 },
+        }),
+      ],
+      annotations: [
+        {
+          path: "src/value.js",
+          start_line: 2,
+          end_line: 2,
+          annotation_level: "failure",
+          title: "Wrong output",
+          message: "Returns zero for positive input",
+        },
+      ],
+    }),
+    "app:fixture-reviewer",
+  );
+  assert.equal(r.findingInstances.length, 1);
+  assert.equal(r.findingInstances[0].reviewedCommit, A);
+  assert.match(r.findingInstances[0].body, /Returns zero/);
+});
+test("discovery includes a check-only reviewer and excludes ordinary CI", () => {
+  const f = githubFixture({
+    checks: [
+      reviewerCheck(),
+      reviewerCheck({
+        id: 100,
+        name: "build",
+        app: { slug: "github-actions" },
+      }),
+    ],
+  });
+  const p = spawnSync(
+    process.execPath,
+    [
+      join(skill, "scripts/collect-review-corpus.mjs"),
+      "--repo",
+      repo,
+      "--since",
+      "2026-01-01",
+      "--until",
+      "2026-02-01",
+      "--no-ready-timeline",
+      "--out",
+      join(f.root, "collected.json"),
+    ],
+    { encoding: "utf8", env: f.env },
+  );
+  assert.equal(p.status, 0, p.stderr);
+  assert.deepEqual(
+    read(join(f.root, "collected.json")).roster.map((r) => r.login),
+    ["app:fixture-reviewer"],
+  );
+});
+test("all check attempts are retained and an unfamiliar app can be selected explicitly", () => {
+  const r = fetch(
+    githubFixture({
+      checks: [
+        reviewerCheck({ name: "Inspector", id: 99 }),
+        reviewerCheck({ name: "Inspector", id: 100 }),
+      ],
+    }),
+    "app:fixture-reviewer",
+  );
+  assert.deepEqual(
+    r.reviewEvents.map((e) => e.id),
+    ["check-99", "check-100"],
+  );
+  assert.deepEqual(r.reviewersByCommit, { [A]: ["app:fixture-reviewer"] });
+});
+test("preparation marks a failed-only check reviewer not measurable", () => {
+  const f = githubFixture({
+    checks: [reviewerCheck({ conclusion: "timed_out" })],
+  });
+  const run = join(f.root, "prepared-checks");
+  const p = spawnSync(
+    process.execPath,
+    [
+      join(skill, "scripts/audit-reviewers.mjs"),
+      "prepare",
+      "--repo",
+      repo,
+      "--prs",
+      "1",
+      "--only",
+      "app:fixture-reviewer",
+      "--provider",
+      "fixture",
+      "--model",
+      "fixture",
+      "--out",
+      run,
+    ],
+    { encoding: "utf8", env: f.env },
+  );
+  assert.equal(p.status, 0, p.stderr);
+  assert.equal(
+    read(join(run, "manifest.json")).reviewers[0].state,
+    "not_measurable",
+  );
+  assert.deepEqual(read(join(run, "raw/1.json")).reviewersByCommit, {});
+});
+test("check pagination keeps every page and rejects malformed responses", async () => {
+  const { checkPages } = await import("../scripts/lib/reviewer-checks.mjs");
+  assert.deepEqual(
+    checkPages([
+      { check_runs: [reviewerCheck()] },
+      { check_runs: [reviewerCheck({ id: 100 })] },
+    ]).map((c) => c.id),
+    [99, 100],
+  );
+  assert.throws(() => checkPages([{ message: "Forbidden" }]), /Malformed/);
+});
+test("an incomplete annotation read stops collection instead of losing findings", () => {
+  const f = githubFixture({
+    checks: [
+      reviewerCheck({
+        output: { summary: "1 issue found", annotations_count: 1 },
+      }),
+    ],
+  });
+  const p = spawnSync(
+    process.execPath,
+    [
+      join(skill, "scripts/fetch-pr-reviews.mjs"),
+      "--repo",
+      repo,
+      "--pr",
+      "1",
+      "--only",
+      "app:fixture-reviewer",
+    ],
+    { encoding: "utf8", env: f.env },
+  );
+  assert.notEqual(p.status, 0);
+  assert.match(p.stderr, /annotation collection is incomplete/);
 });
