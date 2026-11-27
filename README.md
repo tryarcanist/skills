@@ -6,7 +6,28 @@ Skills that let a coding agent (Claude Code, Codex, Cursor, and others that read
 | --- | --- |
 | [`arcanist-review-loop`](arcanist-review-loop/SKILL.md) | Review a PR with Arcanist, fix every finding, push, and repeat until it says **Ready to merge**. Works with the `arcanist` CLI or with `gh` alone. |
 
-## Install
+## Audit your code reviewers
+
+The [`audit-code-reviewers`](audit-code-reviewers/SKILL.md) skill compares verified catches, false positives, overlap, and gaps in your review history. It creates a local report with evidence links. It uses GitHub read access and your coding agent. No Arcanist account is required.
+
+Install through the Arcanist CLI:
+
+```bash
+npx --yes @tryarcanist/cli@latest audit
+```
+
+Then give your coding agent the prompt printed by the command. The default destination is `.agents/skills/audit-code-reviewers` in your current project. Use `--agent claude` for `.claude/skills` instead. The CLI installs the skill; your agent performs the analysis.
+
+Try the synthetic report without GitHub access or model calls:
+
+```bash
+node audit-code-reviewers/scripts/demo.mjs --out /tmp/reviewer-audit-demo
+node --test audit-code-reviewers/tests/integration.test.mjs
+```
+
+Use a new output directory for each demo.
+
+## Install the review loop
 
 Claude Code:
 

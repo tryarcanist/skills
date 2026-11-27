@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audit Code Reviewers"
+  short_description: "Inspect reviewer value, overlap and cost"
+  default_prompt: "Use $audit-code-reviewers to audit the reviewers on this repository and produce a local report with verified catches, noise, overlap and conditional savings."
