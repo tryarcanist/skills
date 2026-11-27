@@ -10,13 +10,19 @@ Skills that let a coding agent (Claude Code, Codex, Cursor, and others that read
 
 The [`audit-code-reviewers`](audit-code-reviewers/SKILL.md) skill compares verified catches, false positives, overlap, and gaps in your review history. It creates a local report with evidence links. It uses GitHub read access and your coding agent. No Arcanist account is required.
 
-Install through the Arcanist CLI:
+Give your coding agent this prompt with your repository open:
+
+> Audit the code reviewers on this repository. Read https://www.tryarcanist.com/audit.md and follow the instructions.
+
+The agent installs through the Arcanist CLI:
 
 ```bash
-npx --yes @tryarcanist/cli@latest audit
+npx --yes @tryarcanist/cli@latest audit --json
 ```
 
-Then give your coding agent the prompt printed by the command. The default destination is `.agents/skills/audit-code-reviewers` in your current project. Use `--agent claude` for `.claude/skills` instead. The CLI installs the skill; your agent performs the analysis.
+The command installs into both `.agents/skills/audit-code-reviewers` and `.claude/skills/audit-code-reviewers` in the current project. No agent selector is needed. Use `--agent codex`, `--agent cursor`, or `--agent claude` to select one location.
+
+The JSON response includes `auditStatus: "not_started"` and `nextAction`. The agent reads `nextAction.path` and follows the skill to complete the audit. The CLI installs the skill; the coding agent performs the analysis.
 
 Try the synthetic report without GitHub access or model calls:
 
