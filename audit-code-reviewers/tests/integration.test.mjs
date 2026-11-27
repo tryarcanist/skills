@@ -1037,6 +1037,11 @@ test("discovery includes a check-only reviewer and excludes ordinary CI", () => 
     checks: [
       reviewerCheck(),
       reviewerCheck({
+        id: 101,
+        name: "Macroscope - Correctness Check",
+        app: { slug: "macroscopeapp" },
+      }),
+      reviewerCheck({
         id: 100,
         name: "build",
         app: { slug: "github-actions" },
@@ -1062,7 +1067,7 @@ test("discovery includes a check-only reviewer and excludes ordinary CI", () => 
   assert.equal(p.status, 0, p.stderr);
   assert.deepEqual(
     read(join(f.root, "collected.json")).roster.map((r) => r.login),
-    ["app:fixture-reviewer"],
+    ["app:fixture-reviewer", "app:macroscopeapp"],
   );
 });
 test("all check attempts are retained and an unfamiliar app can be selected explicitly", () => {
@@ -1147,4 +1152,125 @@ test("an incomplete annotation read stops collection instead of losing findings"
   );
   assert.notEqual(p.status, 0);
   assert.match(p.stderr, /annotation collection is incomplete/);
+});
+
+test("Macroscope completed reviews grant coverage for clean and issue results", () => {
+  for (const title of [
+    "No issues identified (3 code objects reviewed).",
+    "1 issue identified (1 code object reviewed).",
+    "2 issues identified (7 code objects reviewed).",
+  ]) {
+    const r = fetch(
+      githubFixture({
+        checks: [
+          reviewerCheck({
+            app: { slug: "macroscopeapp" },
+            output: {
+              title,
+              summary: "Merge Base: abc; Head: def",
+              annotations_count: 0,
+            },
+          }),
+        ],
+      }),
+      "app:macroscopeapp",
+    );
+    assert.deepEqual(r.reviewersByCommit, { [A]: ["app:macroscopeapp"] });
+    assert.equal(
+      r.reviewEvents[0].verdict,
+      title.startsWith("No") ? "clear" : "issues_found",
+    );
+  }
+});
+
+test("Bugbot final results grant coverage without inferring it from check success", () => {
+  for (const [summary, verdict] of [
+    [
+      "**Final Result:** Bugbot completed review - no issues found! ✅",
+      "clear",
+    ],
+    [
+      "**Final Result:** Bugbot completed review and found 4 potential issues.",
+      "issues_found",
+    ],
+  ]) {
+    const r = fetch(
+      githubFixture({
+        checks: [
+          reviewerCheck({
+            app: { slug: "cursor" },
+            output: { title: "Bugbot Review", summary, annotations_count: 0 },
+          }),
+        ],
+      }),
+      "app:cursor",
+    );
+    assert.deepEqual(r.reviewersByCommit, { [A]: ["app:cursor"] });
+    assert.equal(r.reviewEvents[0].verdict, verdict);
+  }
+});
+
+test("Macroscope status-only and zero-object checks do not create review coverage", () => {
+  for (const output of [
+    {
+      title: "No outstanding review comments.",
+      summary:
+        "No new review ran — only the status of those comments was re-checked.",
+      text: "1 issue found",
+      annotations_count: 0,
+    },
+    {
+      title: "No issues identified (0 code objects reviewed).",
+      annotations_count: 0,
+    },
+    { title: "Needs Human Approval", annotations_count: 0 },
+  ]) {
+    const r = fetch(
+      githubFixture({
+        checks: [reviewerCheck({ app: { slug: "macroscopeapp" }, output })],
+      }),
+      "app:macroscopeapp",
+    );
+    assert.deepEqual(r.reviewersByCommit, {});
+  }
+});
+
+test("completed reviews with no new issues or published comments keep an unknown verdict", () => {
+  for (const summary of [
+    "**Final Result:** Bugbot completed review - no new issues found! ✅",
+    "AI review ran and left 2 comments",
+  ]) {
+    const r = fetch(
+      githubFixture({
+        checks: [reviewerCheck({ output: { summary, annotations_count: 0 } })],
+      }),
+      "app:fixture-reviewer",
+    );
+    assert.deepEqual(r.reviewersByCommit, { [A]: ["app:fixture-reviewer"] });
+    assert.equal(r.reviewEvents[0].verdict, "unknown");
+  }
+});
+
+test("Bugbot failures and cancellations stay explicit even with a neutral check", () => {
+  for (const [summary, state] of [
+    ["**Result:** Bugbot failed to run", "failed"],
+    [
+      "**Result:** Bugbot run cancelled because a new commit was pushed to the PR",
+      "not_run",
+    ],
+  ]) {
+    const r = fetch(
+      githubFixture({
+        checks: [
+          reviewerCheck({
+            conclusion: "neutral",
+            output: { summary, annotations_count: 0 },
+          }),
+        ],
+      }),
+      "app:fixture-reviewer",
+    );
+    assert.deepEqual(r.reviewersByCommit, {});
+    assert.equal(r.reviewEvents[0].reviewState, state);
+  }
 });
