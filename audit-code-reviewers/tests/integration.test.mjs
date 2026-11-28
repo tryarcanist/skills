@@ -1274,3 +1274,56 @@ test("Bugbot failures and cancellations stay explicit even with a neutral check"
     assert.equal(r.reviewEvents[0].reviewState, state);
   }
 });
+
+test("filtered candidates do not count as posted catches, noise, or engagement", () => {
+  const d = doc();
+  d.defects = [defect("d1", [])];
+  d.instances = [
+    { ...inst(), delivery: "filtered_candidate" },
+    { ...inst(ra, "i2"), defectId: undefined, label: "incorrect", delivery: "filtered_candidate" },
+  ];
+  const f = fixture(d);
+  put(join(f.root, "observations/engagement/1.json"), {
+    repo, pr: 1, authorIsBot: true,
+    findings: d.instances.map(i => ({ instanceId: i.id, reviewer: ra, outcome: "none", evidence: "No posted finding." })),
+  });
+  const r = score(f, ["--engagement", join(f.root, "observations/engagement")]);
+  ok(r);
+  assert.equal(row(r).installedFound, 0);
+  assert.equal(row(r).instances, 0);
+  assert.equal(row(r).labels.incorrect, 0);
+  assert.equal(row(r).eng.n, 0);
+  assert.equal(row(r).engMissing, 0);
+  assert.equal(r.aggregate.filteredCandidates.length, 2);
+  assert.match(r.report, /Filtered candidates are not posted findings/);
+});
+
+test("a later posted finding receives credit even after a filtered candidate", () => {
+  const d = doc();
+  d.defects = [defect()];
+  d.instances = [
+    { ...inst(), delivery: "filtered_candidate" },
+    { ...inst(ra, "i2"), delivery: "published" },
+  ];
+  const r = score(fixture(d));
+  ok(r);
+  assert.equal(row(r).instances, 1);
+  assert.equal(row(r).installedFound, 1);
+  assert.equal(r.aggregate.filteredCandidates.length, 1);
+});
+
+test("unknown delivery values and duplicate links across delivery types fail closed", () => {
+  for (const badDelivery of ["filtered", "", null]) {
+    const d = doc();
+    d.defects = [defect()];
+    d.instances = [{ ...inst(), delivery: badDelivery }];
+    assert.notEqual(score(fixture(d)).status, 0);
+  }
+  const d = doc();
+  d.defects = [defect("d1", [])];
+  d.instances = [
+    { ...inst(), delivery: "filtered_candidate" },
+    { ...inst(ra, "i2"), label: "duplicate", duplicateOf: "i1", delivery: "published" },
+  ];
+  assert.notEqual(score(fixture(d)).status, 0);
+});

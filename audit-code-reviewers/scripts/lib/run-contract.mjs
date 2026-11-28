@@ -243,6 +243,10 @@ export function validateObservation(doc, file, context) {
       `PR ${doc.pr}: duplicate or missing instance id`,
     );
     ids.add(i.id);
+    requireValue(
+      i.delivery === undefined || ["published", "filtered_candidate"].includes(i.delivery),
+      `PR ${doc.pr} ${i.id}: unknown delivery`,
+    );
     i.reviewer = canonical(i.reviewer);
     requireValue(
       [
@@ -315,7 +319,7 @@ export function validateObservation(doc, file, context) {
         `PR ${doc.pr} ${i.id}: claim commit differs from frozen source`,
       );
       const set = confirmed.get(i.defectId) || new Set();
-      set.add(i.reviewer);
+      if (i.delivery !== "filtered_candidate") set.add(i.reviewer);
       confirmed.set(i.defectId, set);
     } else if (!i.duplicateOf)
       requireValue(
@@ -353,6 +357,7 @@ export function validateObservation(doc, file, context) {
         original &&
           !original.duplicateOf &&
           original.reviewer === i.reviewer &&
+          (original.delivery ?? "published") === (i.delivery ?? "published") &&
           i.id !== i.duplicateOf,
         `PR ${doc.pr} ${i.id}: invalid duplicate target`,
       );

@@ -317,6 +317,13 @@ if (args.engagement) {
   }
 }
 
+// Keep diagnostic candidates in the evidence appendix, outside delivered metrics.
+// Validate their sources and engagement first so this cannot hide malformed evidence.
+const filteredCandidates = prs.flatMap((doc) =>
+  doc.instances.filter((i) => i.delivery === "filtered_candidate").map((i) => ({ ...i, pr: doc.pr })),
+);
+for (const doc of prs) doc.instances = doc.instances.filter((i) => i.delivery !== "filtered_candidate");
+
 const reviewers = new Map();
 const R = (login) => {
   if (!reviewers.has(login)) {
@@ -900,6 +907,7 @@ const aggregate = {
     notes: doc.evaluationNotes || [],
   })),
   defects,
+  filteredCandidates,
   decisions,
   savings,
   reviewers: rows.map((r) => ({
@@ -1100,6 +1108,14 @@ if (!defects.length)
     "No verified defects in this audit. This does not prove that the PRs have no defects.",
     "",
   );
+if (filteredCandidates.length) {
+  L.push("### Filtered candidates", "",
+    "Filtered candidates are not posted findings. They do not count toward catches, noise, overlap, or team response.", "",
+    "| Reviewer | Label | Candidate | Evidence |", "|---|---|---|---|");
+  for (const i of filteredCandidates)
+    L.push(`| ${cell(i.reviewer)} | ${cell(i.label)} | ${link(i.id, i.url)} | ${cell(i.evidence)} |`);
+  L.push("");
+}
 L.push(
   "### Other claims",
   "",
