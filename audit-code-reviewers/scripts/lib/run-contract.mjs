@@ -279,8 +279,20 @@ export function validateObservation(doc, file, context) {
         ? source.id
         : null);
     if (sourceEventId != null) {
+      const sourceEvent = events.get(String(sourceEventId));
+      // GitHub can retain an inline comment's native commit while its linked
+      // review names another commit. Keep the exact inline pin, but do not
+      // assign that catch to an incompatible publication event.
+      const conflictingInlinePin =
+        source.kind === "inline" &&
+        /^[a-f0-9]{40}$/i.test(source.reviewedCommit || "") &&
+        /^[a-f0-9]{40}$/i.test(sourceEvent?.reviewedCommit || "") &&
+        sourceEvent.reviewer === i.reviewer &&
+        sourceEvent.reviewedCommit !== source.reviewedCommit &&
+        i.reviewedCommit === source.reviewedCommit &&
+        i.reviewEventId === null;
       requireValue(
-        String(i.reviewEventId) === String(sourceEventId),
+        String(i.reviewEventId) === String(sourceEventId) || conflictingInlinePin,
         `PR ${doc.pr} ${i.id}: publication event differs from frozen source`,
       );
     }

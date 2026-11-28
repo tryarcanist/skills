@@ -1327,3 +1327,31 @@ test("unknown delivery values and duplicate links across delivery types fail clo
   ];
   assert.notEqual(score(fixture(d)).status, 0);
 });
+
+test("a native inline pin can retain catch credit when its linked event has another commit", () => {
+  const d = doc();
+  d.reviewEvents[0].reviewedCommit = B;
+  d.reviewEvents.push({ ...d.reviewEvents[0], id: "review-3", reviewedCommit: A, submittedAt: "2026-01-02T00:00:30Z" });
+  d.reviewersByCommit[B] = [ra];
+  d.defects = [defect()];
+  d.instances = [{ ...inst(), kind: "inline" }];
+  const f = fixture(d);
+  d.instances[0].reviewEventId = null;
+  put(join(f.dir, "1.json"), d);
+  const r = score(f);
+  ok(r);
+  assert.equal(row(r).installedFound, 1);
+  assert.deepEqual(row(r).firstLook, { opp: 0, found: 0 });
+});
+
+test("a consistent publication cannot discard its event attribution", () => {
+  const d = doc();
+  d.defects = [defect()];
+  d.instances = [{ ...inst(), kind: "inline" }];
+  const f = fixture(d);
+  d.instances[0].reviewEventId = null;
+  put(join(f.dir, "1.json"), d);
+  const r = score(f);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /event|publication/i);
+});
