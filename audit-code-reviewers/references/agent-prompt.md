@@ -62,7 +62,8 @@ A source without claims needs an entry in `sourceDispositions`:
 ```
 
 The other source disposition states are `no_claims` and `duplicate_delivery`.
-A summary that repeats inline claims still needs duplicate instances or an explicit duplicate-delivery disposition.
+A summary that repeats inline claims within the same delivery type still needs duplicate instances or an explicit duplicate-delivery disposition.
+If a posted summary asserts a claim that an earlier source only listed as a filtered candidate, record a new posted instance. Do not mark it duplicate or give its source a duplicate-delivery disposition.
 Account for all sources before judging the result.
 
 Apply the labels from the method reference.
@@ -95,8 +96,10 @@ Each instance contains:
 ```
 
 Only confirmed claims name a `defectId`, except duplicate instances that refer to their original claim.
-Use `duplicateOf` for a repeated mechanism from the same reviewer.
-The duplicate target must be a non-duplicate instance from that reviewer.
+Set `delivery` to `filtered_candidate` only when the source explicitly identifies the claim as withheld or filtered. Posted findings use `published` (the default). A filtered candidate does not count as a posted catch or false alarm.
+Use `duplicateOf` for a repeated mechanism from the same reviewer and the same delivery type.
+The duplicate target must be a non-duplicate instance from that reviewer with the same delivery type.
+A posted claim that repeats a filtered candidate gets its own verdict and evidence. Confirmed instances can share the same `defectId`; the posted instance then supplies catch credit. Later posted repeats link to that posted instance.
 
 Runtime verification means actual execution evidence, not confidence language.
 A missing `reviewEventId` makes first-event attribution unavailable.

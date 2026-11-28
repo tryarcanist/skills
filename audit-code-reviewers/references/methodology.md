@@ -96,7 +96,7 @@ It is a descriptive metric, not an equal-attempt experiment.
 - `unverified`: available evidence cannot establish or refute the claim.
 - `drifted`: the claim refers to another code state without a usable historical pin.
 - `out_of_scope`: the claim belongs to an excluded category.
-- `duplicate`: this reviewer repeated the same mechanism. Set `duplicateOf` to the original instance.
+- `duplicate`: this reviewer repeated the same mechanism within the same delivery type. Set `duplicateOf` to the original instance. A posted claim that repeats a filtered candidate needs its own verdict; confirmed entries share a defect, but only the posted entry supplies catch credit.
 
 Deduplicate within and across reviewers by failure mechanism.
 One corrected predicate, guard or value that resolves both claims is evidence for a shared defect.

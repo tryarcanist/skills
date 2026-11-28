@@ -1298,16 +1298,18 @@ test("filtered candidates do not count as posted catches, noise, or engagement",
   assert.match(r.report, /Filtered candidates are not posted findings/);
 });
 
-test("a later posted finding receives credit even after a filtered candidate", () => {
+test("a posted finding and its repeat receive correct credit after a filtered candidate", () => {
   const d = doc();
   d.defects = [defect()];
   d.instances = [
     { ...inst(), delivery: "filtered_candidate" },
     { ...inst(ra, "i2"), delivery: "published" },
+    { ...inst(ra, "i3"), delivery: "published", label: "duplicate", duplicateOf: "i2" },
   ];
   const r = score(fixture(d));
   ok(r);
   assert.equal(row(r).instances, 1);
+  assert.equal(row(r).repeatInstances, 1);
   assert.equal(row(r).installedFound, 1);
   assert.equal(r.aggregate.filteredCandidates.length, 1);
 });
